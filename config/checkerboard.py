@@ -66,13 +66,24 @@ def detect_corners(frame):
     return (pts.reshape(-1, 2) if found else None), gray
 
 
-def fix_ordering(cam_pts, proj_pts):
-    """Guard against the detector returning corners in reversed order."""
-    H1, _ = cv2.findHomography(cam_pts, proj_pts)
-    H2, _ = cv2.findHomography(cam_pts[::-1].copy(), proj_pts)
-    e1 = reproj_error(H1, cam_pts, proj_pts)
-    e2 = reproj_error(H2, cam_pts[::-1].copy(), proj_pts)
-    return cam_pts if e1 <= e2 else cam_pts[::-1].copy()
+def fix_ordering(gray, cam_pts, proj_pts, square_px):
+    """Guard against the detector returning corners in reversed order.
+
+    The inner-corner grid is 180°-symmetric, so both orders fit a homography equally
+    well (and the verification circles land on corners either way). Only the square
+    colours break the symmetry: keep the order whose H puts the board's top-left
+    square (black in make_checkerboard) on a darker camera patch than its white neighbour.
+    """
+    x, y = proj_pts[0] - square_px / 2                    # centre of the top-left (black) square
+    probe = np.array([[[x, y]], [[x + square_px, y]]], np.float32)   # black, then white
+    best = None
+    for cand in (cam_pts, cam_pts[::-1].copy()):
+        H, _ = cv2.findHomography(cand, proj_pts)
+        (bx, by), (wx, wy) = cv2.perspectiveTransform(probe, np.linalg.inv(H)).reshape(-1, 2)
+        contrast = float(gray[int(wy), int(wx)]) - float(gray[int(by), int(bx)])
+        if best is None or contrast > best[0]:
+            best = (contrast, cand)
+    return best[1]
 
 
 def reproj_error(H, cam_pts, proj_pts):
@@ -106,7 +117,9 @@ def main():
     H = None
     while True:
         proj.show(board if H is None else verify(H, last_cam_pts, proj.w, proj.h))
-        cv2.imshow("camera", rig.fit_preview(grab_frame(cap))[0])
+        ok, live = cap.read()                    # preview only: no drain, stays responsive
+        if ok:
+            cv2.imshow("camera", rig.fit_preview(live)[0])
         key = cv2.waitKey(30) & 0xFF
 
         if key == 27:
@@ -115,11 +128,11 @@ def main():
             rig.open_camera_settings(cap)
         if key == 32:  # SPACE
             proj.show(board, args.settle_ms)     # let the projection settle
-            cam_pts, _ = detect_corners(grab_frame(cap))
+            cam_pts, gray = detect_corners(grab_frame(cap))
             if cam_pts is None:
                 print("Checkerboard not found - adjust exposure/focus/board size.")
                 continue
-            cam_pts = fix_ordering(cam_pts, proj_pts)
+            cam_pts = fix_ordering(gray, cam_pts, proj_pts, args.square_px)
             H, inliers = cv2.findHomography(cam_pts, proj_pts, cv2.RANSAC, 2.0)
             err = reproj_error(H, cam_pts, proj_pts)
             print(f"Homography solved. Mean reprojection error: {err:.2f} projector px "

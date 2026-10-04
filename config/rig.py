@@ -10,7 +10,9 @@ projector extended onto the Windows desktop plus a DirectShow camera works.
 
 import argparse
 import ctypes
+import json
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -18,6 +20,7 @@ import numpy as np
 
 CONFIG_DIR = Path(__file__).resolve().parent
 HOMOGRAPHY_PATH = CONFIG_DIR / "cam_to_proj_homography.npz"
+SETTINGS_PATH = CONFIG_DIR / "rig_settings.json"   # per-rig camera/display defaults
 PROJ_WIN = "projector"
 PREVIEW_MAX_W = 1280               # camera previews are shrunk to fit this width
 
@@ -119,13 +122,18 @@ def open_camera_settings(cap):
     cap.set(cv2.CAP_PROP_SETTINGS, 1)
 
 
-def grab_frame(cap, flush=5):
-    # flush a few buffered frames so we see the current projection
-    for _ in range(flush):
-        cap.grab()
-    ok, frame = cap.read()
-    if not ok:
-        raise RuntimeError("camera read failed")
+def grab_frame(cap, drain_s=2.0):
+    """Read frames for drain_s seconds and keep the last, so it shows the current projection.
+
+    A fixed frame count isn't enough: on the Sprout's OV580 at 2208x1656, flushing
+    8 frames after a 1.5 s settle still returned the previous projection.
+    """
+    end, frame = time.monotonic() + drain_s, None
+    while frame is None or time.monotonic() < end:
+        ok, f = cap.read()
+        if not ok:
+            raise RuntimeError("camera read failed")
+        frame = f
     return frame
 
 
@@ -151,14 +159,23 @@ def parse_res(text):
     return int(w), int(h)
 
 
+def load_settings():
+    """This rig's defaults from rig_settings.json (missing file -> built-in defaults)."""
+    if not SETTINGS_PATH.exists():
+        return {}
+    return json.loads(SETTINGS_PATH.read_text())
+
+
 def add_rig_args(parser: argparse.ArgumentParser):
-    parser.add_argument("--camera", type=int, default=0,
+    """Rig flags; defaults come from rig_settings.json, and flags override them."""
+    s = load_settings()
+    parser.add_argument("--camera", type=int, default=s.get("camera", 0),
                         help="OpenCV/DirectShow camera index (see --list)")
-    parser.add_argument("--cam-res", type=parse_res, default=None, metavar="WxH",
-                        help="camera capture resolution, e.g. 3840x2160")
-    parser.add_argument("--display", type=int, default=None,
+    parser.add_argument("--cam-res", type=parse_res, default=s.get("cam_res"), metavar="WxH",
+                        help="camera capture resolution, e.g. 2208x1656")
+    parser.add_argument("--display", type=int, default=s.get("display"),
                         help="projector display index (default: first non-primary)")
-    parser.add_argument("--settle-ms", type=int, default=300,
+    parser.add_argument("--settle-ms", type=int, default=s.get("settle_ms", 300),
                         help="wait after changing the projection before grabbing")
     parser.add_argument("--list", action="store_true",
                         help="list displays and cameras, then exit")

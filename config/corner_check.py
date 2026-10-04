@@ -69,34 +69,36 @@ def draw_loupe(disp, frame, center, pts):
     disp[:h, :w] = patch[:h, :w]
 
 
-def click_tape_marks(frame):
-    """Click the four tape points; returns them in full camera-pixel coords (TL, TR, BR, BL)."""
+def click_tape_marks(frame, labels=CORNERS, title=CLICK_WIN):
+    """Click one point per label (default: the four tape points TL, TR, BR, BL);
+    returns them in full camera-pixel coords."""
     base, scale = rig.fit_preview(frame)
+    n = len(labels)
     pts = []
     state = {"cursor": None, "focus": "cursor"}
 
     def on_mouse(event, x, y, flags, _):
         state["cursor"] = (x / scale, y / scale)
         state["focus"] = "cursor"
-        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
+        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < n:
             pts.append([x / scale, y / scale])
             state["focus"] = "point"
 
-    cv2.namedWindow(CLICK_WIN)
-    cv2.setMouseCallback(CLICK_WIN, on_mouse)
+    cv2.namedWindow(title)
+    cv2.setMouseCallback(title, on_mouse)
     while True:
         disp = base.copy()
-        for name, (x, y) in zip(CORNERS, pts):
+        for name, (x, y) in zip(labels, pts):
             p = (int(x * scale), int(y * scale))
             cv2.circle(disp, p, 6, (0, 255, 0), 2)
             cv2.putText(disp, name, (p[0] + 8, p[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         center = pts[-1] if (state["focus"] == "point" and pts) else state["cursor"]
         if center is not None:
             draw_loupe(disp, frame, tuple(map(float, center)), pts)
-        prompt = (f"click {CORNERS[len(pts)]}" if len(pts) < 4 else "ENTER to accept") + \
+        prompt = (f"click {labels[len(pts)]}" if len(pts) < n else "ENTER to accept") + \
                  "   arrows=nudge  U=undo  ESC=quit"
         cv2.putText(disp, prompt, (10, disp.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.imshow(CLICK_WIN, disp)
+        cv2.imshow(title, disp)
 
         key = cv2.waitKeyEx(20)
         if key == 27:
@@ -108,9 +110,9 @@ def click_tape_marks(frame):
             pts[-1][0] += dx
             pts[-1][1] += dy
             state["focus"] = "point"
-        if key in (13, 10) and len(pts) == 4:
+        if key in (13, 10) and len(pts) == n:
             break
-    cv2.destroyWindow(CLICK_WIN)
+    cv2.destroyWindow(title)
     return np.array(pts, np.float32)
 
 
