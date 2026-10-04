@@ -22,17 +22,20 @@ from PIL import Image
 from track2 import gemini
 from track2.palette import BRUSHES, PIGMENTS
 from track2.schema import MAX_TOTAL_PARTS, PlanDraft, Step, validate_draft
+from track2.voice import VOICE
 
 FIELDS = """For each region give:
-- name: short imperative title, e.g. "Block in the sky"
+- name: short, friendly title, e.g. "Let's put in a happy little sky"
 - mix: pigments with integer parts that mix to roughly the region's mean color.
   Pigments must come from: {pigments}. Total parts at most {max_parts}.
 - brush: one of {brushes}
-- technique: one sentence on how to apply it (stroke style, blending, edges)
+- technique: one or two sentences on how to apply it (stroke style, blending, edges)
 - stroke_dir_deg: dominant stroke direction, 0 = horizontal, 90 = vertical, 0..359
 - success: one sentence a camera could check (coverage, value, stroke direction)
 
-Never invent coordinates or shapes; refer to regions only by what they look like."""
+Never invent coordinates or shapes; refer to regions only by what they look like.
+
+""" + VOICE
 
 PROMPT = """You are an oil/acrylic painting teacher turning a reference image into a
 step-by-step lesson for a beginner. The reference is image 1. It has been split into
@@ -66,7 +69,7 @@ The corrections they received on step {stuck}:
 
 Rewrite the remaining steps so the student can succeed: {reorder}break the hard
 move into a simpler technique, change the mix or brush, and make success criteria easier to
-see. Use each mask_id exactly once; keep step {stuck}'s region among them.
+see. Word the revised step to reassure them: it is a happy accident, not a failure. Use each mask_id exactly once; keep step {stuck}'s region among them.
 """ + FIELDS + "\n{feedback}"
 
 REORDER_FREE = "you may reorder them, "

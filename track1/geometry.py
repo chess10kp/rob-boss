@@ -53,6 +53,8 @@ def detect_canvas_quad(frame, cam_to_proj, proj_size, aspect=None, aspect_tol=0.
         inside = ((qp[:, 0] > edge_margin) & (qp[:, 0] < pw - edge_margin)
                   & (qp[:, 1] > edge_margin) & (qp[:, 1] < ph - edge_margin)).all()
         w, h = quad_size(qp)
+        if min(w, h) <= 0:                      # collapsed to a line or point
+            return 0.0
         shaped = aspect is None or abs(max(w, h) / min(w, h) / aspect - 1) <= aspect_tol
         return area if (min_frac <= area <= max_frac and inside and shaped) else 0.0
 

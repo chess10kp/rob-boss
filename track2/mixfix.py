@@ -55,4 +55,5 @@ def advise(step: Step, l_canvas: float, l_ref: float) -> str:
         pigment = darkest_in_mix(step)
         word = "light"
     p = parts_to_add(total, l_canvas, l_ref, PIGMENT_L.get(pigment, 50.0))
-    return f"The paint is too {word}. Mix in about {fmt_parts(p)} of {pigment} to your {total}-part mix."
+    return (f"That paint's just a touch too {word}, and that's okay - we'll fix it. Mix about "
+            f"{fmt_parts(p)} of {pigment} into your {total}-part mix and give it another go.")

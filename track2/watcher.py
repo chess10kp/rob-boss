@@ -17,9 +17,12 @@ and decides what, if anything, to do:
   3. Looks complete -> the voted Gemini critique confirms. CV is authoritative for coverage
      and value, so Gemini may only object about stroke direction; any other objection is
      ignored. READY advances the step machine; a stroke_direction ADJUST becomes the correction.
-  4. After a correction nothing more is said until the canvas changes (no flip-flop). A step
-     that is still wrong after `max_tries` corrections is re-planned once (replan_fn) instead of
-     just going stuck; if that fails, or it gets stuck again, the machine stays stuck.
+  4. After a correction nothing more is said until the canvas changes (no flip-flop). Each
+     correction is a strike, except a coverage nudge after the painter filled at least
+     `progress_strike_pts` more of the region since the last one (that is progress, not a
+     failure). After `max_tries` strikes the step is re-planned once (replan_fn); either way it
+     stays active and keeps being watched and corrected - the painter can always skip it.
+     `coverage` holds the latest measured coverage, for a live readout.
   5. Before measuring, a hand/brush guard (cv.occlusion) skips captures with skin-coloured
      pixels the reference lacks inside the grown region; it retries shortly. Optionally
      (`outside_change_blocks`) any change outside the region also counts as an obstruction.
@@ -50,13 +53,14 @@ STACK_BARE = 245     # track3.layers' BARE_CANVAS: the picture before a stack's 
 
 @dataclass
 class WatchConfig:
-    settle_s: float = 2.5          # the step's region must be still this long before any check
+    settle_s: float = 2.0          # the step's region must be still this long before any check
     motion_t: float = 2.0          # mean abs gray diff (0-255) in the region above which the painter is "active"
     region_margin: float = 0.08    # region grown by this fraction of canvas width for motion and hands
     change_t: float = 1.5          # diff vs the last checked frame that counts as "changed"
     idle_coverage_s: float = 6.0   # pause needed before "unpainted area" is a mistake, not progress
     confirm_gap_s: float = 2.0     # CV corrections must hold across two measurements this far apart
     complete_cov: float = 0.90     # coverage at which the step looks done -> ask Gemini
+    progress_strike_pts: float = 0.05  # a coverage nudge is no strike if coverage rose this much since the last
     min_cov_for_value: float = 0.25
     value_dl: float = 12.0         # |delta L*| beyond this is "too light/dark"
     paint_de: float = 12.0         # colour distance from bare canvas that counts as painted
@@ -70,7 +74,7 @@ class WatchConfig:
 
 @dataclass
 class Event:
-    kind: str                      # correction | advanced | complete | stuck | replanned
+    kind: str                      # correction | advanced | complete | replanned
     step_index: int
     verdict: Verdict | None = None
     source: str = ""               # cv | gemini
@@ -113,12 +117,13 @@ class Watcher:
     def __init__(self, machine: StepMachine, ref_rgb: np.ndarray, scene_dir: Path,
                  capture: Callable[[], np.ndarray], critique_fn: CritiqueFn | None = None,
                  config: WatchConfig | None = None, bare_rgb=cvmod.DEFAULT_BARE_RGB,
-                 replan_fn: ReplanFn | None = None):
+                 replan_fn: ReplanFn | None = None, log: Callable[[str], None] | None = None):
         self.machine, self.ref, self.scene_dir = machine, ref_rgb, Path(scene_dir)
         self.capture, self.cfg, self.bare_rgb = capture, config or WatchConfig(), bare_rgb
         self.bare_image: np.ndarray | None = None
         self._critique = critique_fn or default_critique(ref_rgb)
         self._replan = replan_fn
+        self._log = log or (lambda msg: None)
         self._replanned: set[int] = set()   # step indexes already re-planned once: never loop
         self._masks: dict[int, tuple] = {}
         self._frames: dict[str, tuple[Path | None, Path]] | None = None
@@ -139,6 +144,8 @@ class Watcher:
         self._streak: tuple[str, float] | None = None  # (category, time first seen)
         self._last_canvas: np.ndarray | None = None    # last capture accepted as unobstructed
         self._occluded_since: float | None = None
+        self._nudged_cov = 0.0                         # coverage at the last coverage nudge (step starts bare)
+        self.coverage: float | None = None             # latest measured coverage of this step, 0..1
 
     def rebase(self, canvas_bgr: np.ndarray) -> None:
         """A step is finished: the canvas as it is now is the starting point for the next one."""
@@ -187,11 +194,11 @@ class Watcher:
             self._grown[step.index] = cv2.dilate(mask.astype(np.uint8), k).astype(bool)
         return self._grown[step.index]
 
-    def _motion(self, small: np.ndarray, prev: np.ndarray, step: Step) -> float:
-        """Mean frame-to-frame change inside the grown region (whole frame if it is empty)."""
+    def _region_diff(self, small: np.ndarray, other: np.ndarray, step: Step) -> float:
+        """Mean change between two small frames inside the grown region (whole frame if it is empty)."""
         region = cv2.resize(self._grown_region(step).astype(np.uint8), small.shape[::-1],
                             interpolation=cv2.INTER_NEAREST).astype(bool)
-        diff = np.abs(small - prev)
+        diff = np.abs(small - other)
         return float(diff[region].mean()) if region.any() else float(diff.mean())
 
     def tick(self, peek_bgr: np.ndarray, now: float) -> Event | None:
@@ -201,7 +208,7 @@ class Watcher:
         if step is None or self.machine.status != "active" or prev is None:
             return None
 
-        if self._motion(small, prev, step) > cfg.motion_t:         # painter active in the region -> debounce
+        if self._region_diff(small, prev, step) > cfg.motion_t:         # painter active in the region -> debounce
             self._still_since = None
             return None
         if self._still_since is None:
@@ -209,7 +216,7 @@ class Watcher:
         if now - self._still_since < cfg.settle_s:
             return None
 
-        changed = self._checked is None or float(np.abs(small - self._checked).mean()) > cfg.change_t
+        changed = self._checked is None or self._region_diff(small, self._checked, step) > cfg.change_t
         if not changed and (self._recheck_at is None or now < self._recheck_at):
             return None                                             # nothing new to look at
         self._checked, self._recheck_at = small, None
@@ -221,6 +228,7 @@ class Watcher:
             return None
         m = cvmod.measure(canvas, target, mask, bare_rgb=self.bare_rgb, bare_image=self.bare_image,
                           before_rgb=before, paint_de=cfg.paint_de, value_dl=cfg.value_dl)
+        self.coverage = m.coverage if m.checkable else None
 
         verdict, source = None, "cv"
         if m.checkable and m.delta_l is not None and m.coverage >= cfg.min_cov_for_value \
@@ -229,8 +237,9 @@ class Watcher:
         elif m.checkable and m.coverage < cfg.complete_cov:
             if now - self._still_since >= cfg.idle_coverage_s:
                 verdict = Verdict(verdict="ADJUST", category="coverage",
-                                  adjustment=f"Fill in the unpainted areas ({(1 - m.coverage) * 100:.0f}% of this "
-                                             "step's region is still bare).")
+                                  adjustment=f"There's still a little bare canvas waiting for some love - about "
+                                             f"{(1 - m.coverage) * 100:.0f}% of this area. Let's go "
+                                             "back in and fill it right in.")
             else:                                                   # still working: progress, not a mistake
                 self._recheck_at = self._still_since + cfg.idle_coverage_s
                 self._streak = None
@@ -252,7 +261,11 @@ class Watcher:
                 self._recheck_at = self._streak[1] + cfg.confirm_gap_s
                 return None
         self._streak = None
-        return self._correct(step, verdict, source, now,
+        strike = True
+        if verdict.category == "coverage":         # filling in steadily is progress, not a failed try
+            strike = m.coverage - self._nudged_cov < cfg.progress_strike_pts
+            self._nudged_cov = m.coverage
+        return self._correct(step, verdict, source, now, strike,
                              missing=m.missing if verdict.category == "coverage" else None,
                              off_value=m.value_off if verdict.category == "value" else None)
 
@@ -263,11 +276,16 @@ class Watcher:
         occ = cvmod.occlusion(canvas, target, mask, self._last_canvas if cfg.outside_change_blocks else None,
                               within=self._grown_region(step), also_expected=expected)
         if occ.skin_frac > cfg.skin_frac_t:
-            self._occluded_since = self._occluded_since if self._occluded_since is not None else now
+            if self._occluded_since is None:
+                self._occluded_since = now
+                self._log(f"check skipped: {occ.skin_frac:.1%} of the canvas looks like a hand near step "
+                          f"{step.index}; retrying every {cfg.recheck_gap_s:g} s")
             return True
         if cfg.outside_change_blocks and occ.outside_change_frac > cfg.outside_change_t:
             if self._occluded_since is None:
                 self._occluded_since = now
+                self._log(f"check skipped: {occ.outside_change_frac:.1%} of the canvas changed outside step "
+                          f"{step.index}; retrying for up to {cfg.occlusion_max_s:g} s")
             if now - self._occluded_since < cfg.occlusion_max_s:
                 return True
         self._occluded_since = None                                  # clear (or accept a lasting change)
@@ -279,19 +297,17 @@ class Watcher:
         return Verdict(verdict="ADJUST", category="value",
                        adjustment=mixfix.advise(step, m.mean_l_canvas, m.mean_l_ref))
 
-    def _correct(self, step, verdict, source, now, missing=None, off_value=None) -> Event:
-        status = self.machine.submit(verdict)
-        if status == "stuck":
+    def _correct(self, step, verdict, source, now, strike=True, missing=None, off_value=None) -> Event:
+        if self.machine.submit(verdict, strike=strike) == "struggling":
             revised = self._try_replan(step)
             if revised:
                 self._reset_step()
                 self._checked = self._prev   # give the painter time to act: no re-check until the canvas changes
                 return Event("replanned", step.index, verdict, source, now=now, new_steps=revised)
-        kind = "stuck" if status == "stuck" else "correction"
-        return Event(kind, step.index, verdict, source, missing, off_value, now)
+        return Event("correction", step.index, verdict, source, missing, off_value, now)
 
     def _try_replan(self, step: Step) -> list[Step] | None:
-        """On a stuck step, ask for a revised plan once; any failure falls back to plain 'stuck'."""
+        """On a struggling step, ask for a revised plan once; any failure leaves the plan as it is."""
         if self._replan is None or step.index in self._replanned:
             return None
         self._replanned.add(step.index)
@@ -299,7 +315,8 @@ class Watcher:
         canvas = self._last_canvas if self._last_canvas is not None else np.zeros((8, 8, 3), np.uint8)
         try:
             revised = self._replan(position, self.machine.state["history"], canvas)
-        except Exception:
+        except Exception as e:
+            self._log(f"re-plan of step {step.index} failed ({type(e).__name__}: {e}); keeping the plan")
             return None
         self.machine.replace_remaining(revised)
         return revised

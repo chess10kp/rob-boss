@@ -15,6 +15,7 @@ from PIL import Image
 
 from track2 import gemini
 from track2.schema import Step, Verdict, verdict_is_consistent
+from track2.voice import VOICE
 
 PROMPT = """You are a painting coach checking a student's work on ONE step of a landscape.
 Image 1 is the reference the student is copying. Image 2 is a photo of their canvas right
@@ -26,10 +27,12 @@ Current step:
 
 If the step is done well enough to move on, return verdict READY, category none, empty
 adjustment. Otherwise return verdict ADJUST with exactly ONE adjustment: the single most
-important defect, as one imperative sentence. Never list several problems. Do not invent
-problems on a step that is done. Categories: value = paint too light/dark vs the target,
-coverage = parts of this step's region unpainted or incomplete, stroke_direction = strokes
-not running the way the step says."""
+important defect, as one gentle sentence that says what to do next. Never list several
+problems. Do not invent problems on a step that is done. Categories: value = paint too
+light/dark vs the target, coverage = parts of this step's region unpainted or incomplete,
+stroke_direction = strokes not running the way the step says.
+
+""" + VOICE
 
 
 def vote(samples: list[Verdict]) -> Verdict:
