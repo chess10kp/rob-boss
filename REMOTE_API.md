@@ -2,13 +2,17 @@
 
 The local agent exposes the GIMP MCP decomposition workflow through an authenticated HTTP API.
 
-## Current endpoint
+## Start the hosted API
 
-```text
-https://blackjack-prime-maryland-different.trycloudflare.com
+Run this from the repository root:
+
+```bash
+./scripts/serve_remote_api.sh
 ```
 
-This is a Cloudflare Quick Tunnel URL. It is temporary and changes when the tunnel restarts. A permanent hostname requires a named Cloudflare Tunnel.
+The script starts `server.py`, waits for `/healthz`, starts a Cloudflare Quick
+Tunnel, and prints the temporary `BASE_URL`. Keep it running; `Ctrl-C` stops
+both processes. The URL changes whenever the tunnel restarts.
 
 ## Process an image
 
@@ -23,7 +27,7 @@ This is a Cloudflare Quick Tunnel URL. It is temporary and changes when the tunn
 Authentication uses the bearer token stored locally at `~/.cache/rob-boss/agent-api-token`.
 
 ```bash
-BASE_URL="https://blackjack-prime-maryland-different.trycloudflare.com"
+BASE_URL="https://chassis-delhi-approaches-eating.trycloudflare.com"  # replace with the URL printed by the startup script
 TOKEN="$(cat ~/.cache/rob-boss/agent-api-token)"
 
 curl --fail-with-body "$BASE_URL/process" \
