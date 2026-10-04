@@ -16,6 +16,8 @@ and decides what, if anything, to do:
      and value, so Gemini may only object about stroke direction; any other objection is
      ignored. READY advances the step machine; a stroke_direction ADJUST becomes the correction.
   4. After a correction nothing more is said until the canvas changes (no flip-flop).
+  5. Before measuring, a hand/brush guard (cv.occlusion) skips captures that contain skin-coloured
+     pixels the reference lacks, or change outside the step's region; it retries shortly.
 
 Frames are BGR uint8 arrays, matching track1.Rig. `peek` frames feed the motion gate and
 should be cheap (no projector flash); `capture()` is the accurate flash-lit canvas capture,
@@ -47,6 +49,10 @@ class WatchConfig:
     min_cov_for_value: float = 0.25
     value_dl: float = 12.0         # |delta L*| beyond this is "too light/dark"
     paint_de: float = 12.0         # colour distance from bare canvas that counts as painted
+    skin_frac_t: float = 0.02      # canvas fraction of unexpected skin-coloured pixels = hand in frame
+    outside_change_t: float = 0.03  # canvas fraction changed outside the step region = something in the way
+    recheck_gap_s: float = 1.0     # retry this soon after skipping an occluded capture
+    occlusion_max_s: float = 12.0  # after this, stop treating outside-region change as an obstruction
 
 
 @dataclass
@@ -96,6 +102,8 @@ class Watcher:
         self._checked: np.ndarray | None = None   # peek frame at the last check
         self._recheck_at: float | None = None
         self._streak: tuple[str, float] | None = None  # (category, time first seen)
+        self._last_canvas: np.ndarray | None = None    # last capture accepted as unobstructed
+        self._occluded_since: float | None = None
 
     def _mask(self, step: Step) -> np.ndarray:
         if step.index not in self._masks:
@@ -124,6 +132,9 @@ class Watcher:
 
         mask = self._mask(step)
         canvas = cv2.cvtColor(self.capture(), cv2.COLOR_BGR2RGB)
+        if self._obstructed(canvas, mask, now):                     # hand/brush in the way: look again soon
+            self._recheck_at = now + cfg.recheck_gap_s
+            return None
         m = cvmod.measure(canvas, self.ref, mask, bare_rgb=self.bare_rgb, paint_de=cfg.paint_de)
 
         verdict, source = None, "cv"
@@ -156,6 +167,21 @@ class Watcher:
                 return None
         self._streak = None
         return self._correct(step, verdict, source, m.missing if verdict.category == "coverage" else None, now)
+
+    def _obstructed(self, canvas: np.ndarray, mask: np.ndarray, now: float) -> bool:
+        cfg = self.cfg
+        occ = cvmod.occlusion(canvas, self.ref, mask, self._last_canvas)
+        if occ.skin_frac > cfg.skin_frac_t:
+            self._occluded_since = self._occluded_since if self._occluded_since is not None else now
+            return True
+        if occ.outside_change_frac > cfg.outside_change_t:
+            if self._occluded_since is None:
+                self._occluded_since = now
+            if now - self._occluded_since < cfg.occlusion_max_s:
+                return True
+        self._occluded_since = None                                  # clear (or accept a lasting change)
+        self._last_canvas = canvas
+        return False
 
     @staticmethod
     def _value_verdict(delta_l: float) -> Verdict:

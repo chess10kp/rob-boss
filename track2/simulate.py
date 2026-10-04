@@ -17,12 +17,19 @@ class SimFeed:
         w, h = size
         self.canvas = np.full((h, w, 3), DEFAULT_BARE_RGB, np.uint8)
         self._n = 0
+        self.resting_hand = False   # a still hand in view: shows in both peek and capture
 
     def set(self, canvas_rgb: np.ndarray) -> None:
         self.canvas = canvas_rgb.astype(np.uint8)
 
+    def _rest(self, frame: np.ndarray) -> np.ndarray:
+        if self.resting_hand:
+            h, w = frame.shape[:2]
+            cv2.ellipse(frame, (w // 2, h // 4), (w // 6, h // 5), 0, 0, 360, (40, 60, 90), -1)
+        return frame
+
     def peek(self, hand: bool = False) -> np.ndarray:
-        frame = cv2.cvtColor(self.canvas, cv2.COLOR_RGB2BGR).copy()
+        frame = self._rest(cv2.cvtColor(self.canvas, cv2.COLOR_RGB2BGR).copy())
         if hand:
             self._n += 1
             h, w = frame.shape[:2]
@@ -32,7 +39,7 @@ class SimFeed:
         return frame
 
     def capture(self) -> np.ndarray:
-        return cv2.cvtColor(self.canvas, cv2.COLOR_RGB2BGR)
+        return self._rest(cv2.cvtColor(self.canvas, cv2.COLOR_RGB2BGR).copy())
 
 
 def run(watcher, feed: SimFeed, script, dt: float = 0.5, t0: float = 0.0):

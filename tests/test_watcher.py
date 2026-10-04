@@ -146,6 +146,25 @@ class WatcherTest(unittest.TestCase):
         events = run(w, self.feed, [(paint(self.ref, self.masks[0]), 1.0, 8.0)])
         self.assertEqual([e.kind for _, e in events], ["advanced"])
 
+    def test_resting_hand_blocks_the_check_until_it_leaves(self) -> None:
+        w = self.watcher()
+        done = paint(self.ref, self.masks[0])
+        self.feed.resting_hand = True
+        events = run(w, self.feed, [(done, 1.0, 20.0)])        # hand sits on the canvas, perfectly still
+        self.assertEqual((events, self.calls), ([], 0))
+        self.feed.resting_hand = False
+        events = run(w, self.feed, [(done, 0.0, 6.0)], t0=30.0)  # hand leaves: capture now clean
+        self.assertEqual([e.kind for _, e in events], ["advanced"])
+
+    def test_change_outside_the_step_region_is_an_obstruction_for_a_while(self) -> None:
+        w = self.watcher()
+        step1 = paint(self.ref, self.masks[0])
+        run(w, self.feed, [(paint(self.ref, self.masks[0], rows_frac=0.2), 1.0, 3.0)])  # a first accepted capture
+        stray = step1.copy()
+        stray[H // 2 + 5:H - 5, 10:W - 10] = (30, 30, 30)       # something dark lying on the later step's area
+        events = run(w, self.feed, [(stray, 1.0, 8.0)], t0=10.0)
+        self.assertEqual((events, self.calls), ([], 0))          # skipped, not judged
+
     def test_stuck_after_three_corrections(self) -> None:
         w = self.watcher()
         t = 0.0

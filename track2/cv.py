@@ -66,3 +66,41 @@ def measure(canvas_rgb: np.ndarray, ref_rgb: np.ndarray, mask: np.ndarray, *,
         delta_l = float(mean_c[0] - mean_r[0])
         delta_e = float(np.linalg.norm(mean_c - mean_r))
     return Measurement(True, coverage, delta_l, delta_e, needs_paint & ~painted_any, int(painted.sum()))
+
+
+@dataclass
+class Occlusion:
+    skin_frac: float            # fraction of the canvas that looks like skin where the reference does not
+    outside_change_frac: float  # fraction of the canvas changed outside this step's region since `last`
+
+
+def _skin_like(rgb: np.ndarray) -> np.ndarray:
+    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+    cr, cb = ycrcb[..., 1], ycrcb[..., 2]
+    return (cr >= 135) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+
+
+def occlusion(canvas_rgb: np.ndarray, ref_rgb: np.ndarray, mask: np.ndarray,
+              last_rgb: np.ndarray | None = None, *, change_de: float = 25.0,
+              margin_px: int = 15) -> Occlusion:
+    """Is something other than paint (a hand, brush, palette) in the capture?
+
+    Two signals. Skin-coloured pixels that the reference does not have there (so orange sky
+    is not mistaken for a hand). And change outside the current step's region compared with
+    the last accepted capture: earlier steps are finished and later ones are bare, so
+    nothing legitimate should change there. A hand lying over a skin-coloured part of the
+    reference is not detectable by colour.
+    """
+    h, w = mask.shape[:2]
+    canvas = cv2.resize(canvas_rgb, (w, h), interpolation=cv2.INTER_AREA)
+    ref = cv2.resize(ref_rgb, (w, h), interpolation=cv2.INTER_AREA)
+    bad = (_skin_like(canvas) & ~_skin_like(ref)).astype(np.uint8)
+    skin_frac = float(cv2.erode(bad, np.ones((3, 3), np.uint8)).mean())
+
+    outside_frac = 0.0
+    if last_rgb is not None:
+        last = cv2.resize(last_rgb, (w, h), interpolation=cv2.INTER_AREA)
+        grown = cv2.dilate((mask > 127).astype(np.uint8), np.ones((margin_px, margin_px), np.uint8)).astype(bool)
+        changed = np.linalg.norm(to_lab(canvas) - to_lab(last), axis=2) > change_de
+        outside_frac = float((changed & ~grown).mean())
+    return Occlusion(skin_frac, outside_frac)
