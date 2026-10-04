@@ -6,3 +6,4 @@ spikes/spike_d/out/
 config/cam_to_proj_homography.npz
 config/tape_marks.json
 config/logs/
+scenes/
