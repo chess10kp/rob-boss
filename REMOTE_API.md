@@ -27,7 +27,7 @@ both processes. The URL changes whenever the tunnel restarts.
 Authentication uses the bearer token stored locally at `~/.cache/rob-boss/agent-api-token`.
 
 ```bash
-BASE_URL="https://chassis-delhi-approaches-eating.trycloudflare.com"  # replace with the URL printed by the startup script
+BASE_URL="https://meaning-bobby-fiction-packet.trycloudflare.com"  # replace with the URL printed by the startup script
 TOKEN="$(cat ~/.cache/rob-boss/agent-api-token)"
 
 curl --fail-with-body "$BASE_URL/process" \
