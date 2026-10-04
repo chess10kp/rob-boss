@@ -52,15 +52,21 @@ MASK_NOTE = (" Image 3 is this step's region: WHITE is where paint belongs now, 
              " only inside the white area.")
 
 
-def critique(ref, capture, step: Step, *, mask=None, n: int = 3, client=None,
+CV_NOTE = (" Coverage and colour of this region have ALREADY been verified by measurement, so do"
+           " not report coverage or value. Judge only whether the brush strokes run the way the"
+           " step says (stroke_direction); if they do, return READY.")
+
+
+def critique(ref, capture, step: Step, *, mask=None, cv_verified: bool = False, n: int = 3, client=None,
              model: str = gemini.DEFAULT_MODEL) -> Verdict:
-    """`mask`: the step's mask image/path. Needed when regions are scattered (value bands)."""
+    """`mask`: the step's mask image/path. Needed when regions are scattered (value bands).
+    `cv_verified`: coverage/value were already measured locally; ask only about strokes."""
     ref_img, cap_img = _load(ref), _load(capture)
     images = [ref_img, cap_img] + ([_load(mask)] if mask is not None else [])
     client = client or gemini.make_client()
     # The mask path is a file pointer, not something Gemini can read; keep it out of the prompt.
     prompt = PROMPT.format(step=json.dumps(step.model_dump(exclude={"mask_path"}), indent=2),
-                           mask_note=MASK_NOTE if mask is not None else "")
+                           mask_note=(MASK_NOTE if mask is not None else "") + (CV_NOTE if cv_verified else ""))
 
     def sample(_: int) -> Verdict | None:
         for _try in range(3):  # schema enforcement: re-ask if the reply is internally inconsistent

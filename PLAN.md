@@ -166,6 +166,15 @@ Spikes owned: **D**
   renderer never receives a malformed step.
 - **Step machine** — advance / retry / stuck-after-3-tries, held in a plain dict
   for now (Backboard slots in here later).
+- **Watcher (hands-free)** — no button. A motion gate debounces on the painter's
+  hand: checks run only after the canvas has been still ~1.5 s and changed. Local
+  CV (`track2/cv.py`) measures coverage and value inside the step's mask — exact,
+  free, and authoritative for those two. Gemini is called only to confirm a step
+  that looks complete, and may only object about stroke direction. Corrections
+  need two agreeing measurements and are not repeated until the canvas changes.
+  Needs from Track 1: a cheap frame for motion (no projector flash) plus the
+  existing flash-lit `capture_canvas()` for measurement. Thresholds in
+  `WatchConfig` are rig-dependent and need tuning on the real camera.
 
 ```
 plan(ref, masks) -> [step]
