@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+# per-rig calibration output - regenerate on each machine
+config/cam_to_proj_homography.npz
+config/tape_marks.json
+config/logs/
