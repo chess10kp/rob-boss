@@ -10,3 +10,4 @@ config/canvas_quad.json
 config/projector_profile.json
 config/logs/
 scenes/
+config/rehearsal_lighting.json
