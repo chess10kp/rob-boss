@@ -15,7 +15,9 @@ and decides what, if anything, to do:
   3. Looks complete -> the voted Gemini critique confirms. CV is authoritative for coverage
      and value, so Gemini may only object about stroke direction; any other objection is
      ignored. READY advances the step machine; a stroke_direction ADJUST becomes the correction.
-  4. After a correction nothing more is said until the canvas changes (no flip-flop).
+  4. After a correction nothing more is said until the canvas changes (no flip-flop). A step
+     that is still wrong after `max_tries` corrections is re-planned once (replan_fn) instead of
+     just going stuck; if that fails, or it gets stuck again, the machine stays stuck.
   5. Before measuring, a hand/brush guard (cv.occlusion) skips captures that contain skin-coloured
      pixels the reference lacks, or change outside the step's region; it retries shortly.
 
@@ -34,6 +36,7 @@ import numpy as np
 from PIL import Image
 
 from track2 import cv as cvmod
+from track2 import mixfix
 from track2.machine import StepMachine
 from track2.schema import Step, Verdict
 
@@ -57,19 +60,33 @@ class WatchConfig:
 
 @dataclass
 class Event:
-    kind: str                      # correction | advanced | complete | stuck
+    kind: str                      # correction | advanced | complete | stuck | replanned
     step_index: int
     verdict: Verdict | None = None
     source: str = ""               # cv | gemini
-    missing: np.ndarray | None = None  # canvas-space bool map of still-bare areas (for projection)
+    missing: np.ndarray | None = None  # mask-space bool map of still-bare areas (for projection)
+    off_value: np.ndarray | None = None  # mask-space bool map of painted areas that are too light/dark
     now: float = 0.0
+    new_steps: list[Step] | None = None  # replanned: the revised current + remaining steps
 
 
+# (current step position, correction history, last unobstructed canvas RGB) -> revised remaining steps
+ReplanFn = Callable[[int, list, np.ndarray], list[Step]]
 CritiqueFn = Callable[[np.ndarray, Step, np.ndarray], Verdict]  # (canvas_rgb, step, mask) -> voted verdict
 
 
 def _small_gray(bgr: np.ndarray) -> np.ndarray:
     return cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (96, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def default_replan(ref_rgb: np.ndarray, machine: StepMachine, scene_dir: Path) -> ReplanFn:
+    from track2.planner import replan
+
+    def run(position: int, history: list, canvas_rgb: np.ndarray) -> list[Step]:
+        return replan(Image.fromarray(ref_rgb), Image.fromarray(canvas_rgb), machine.steps, position,
+                      history, scene_dir=scene_dir)
+
+    return run
 
 
 def default_critique(ref_rgb: np.ndarray):
@@ -85,10 +102,13 @@ def default_critique(ref_rgb: np.ndarray):
 class Watcher:
     def __init__(self, machine: StepMachine, ref_rgb: np.ndarray, scene_dir: Path,
                  capture: Callable[[], np.ndarray], critique_fn: CritiqueFn | None = None,
-                 config: WatchConfig | None = None, bare_rgb=cvmod.DEFAULT_BARE_RGB):
+                 config: WatchConfig | None = None, bare_rgb=cvmod.DEFAULT_BARE_RGB,
+                 replan_fn: ReplanFn | None = None):
         self.machine, self.ref, self.scene_dir = machine, ref_rgb, Path(scene_dir)
         self.capture, self.cfg, self.bare_rgb = capture, config or WatchConfig(), bare_rgb
         self._critique = critique_fn or default_critique(ref_rgb)
+        self._replan = replan_fn
+        self._replanned: set[int] = set()   # step indexes already re-planned once: never loop
         self._masks: dict[int, np.ndarray] = {}
         self._reset_step()
         self._prev: np.ndarray | None = None
@@ -135,12 +155,12 @@ class Watcher:
         if self._obstructed(canvas, mask, now):                     # hand/brush in the way: look again soon
             self._recheck_at = now + cfg.recheck_gap_s
             return None
-        m = cvmod.measure(canvas, self.ref, mask, bare_rgb=self.bare_rgb, paint_de=cfg.paint_de)
+        m = cvmod.measure(canvas, self.ref, mask, bare_rgb=self.bare_rgb, paint_de=cfg.paint_de, value_dl=cfg.value_dl)
 
         verdict, source = None, "cv"
         if m.checkable and m.delta_l is not None and m.coverage >= cfg.min_cov_for_value \
                 and abs(m.delta_l) > cfg.value_dl:
-            verdict = self._value_verdict(m.delta_l)
+            verdict = self._value_verdict(step, m)
         elif m.checkable and m.coverage < cfg.complete_cov:
             if now - self._still_since >= cfg.idle_coverage_s:
                 verdict = Verdict(verdict="ADJUST", category="coverage",
@@ -166,7 +186,9 @@ class Watcher:
                 self._recheck_at = self._streak[1] + cfg.confirm_gap_s
                 return None
         self._streak = None
-        return self._correct(step, verdict, source, m.missing if verdict.category == "coverage" else None, now)
+        return self._correct(step, verdict, source, now,
+                             missing=m.missing if verdict.category == "coverage" else None,
+                             off_value=m.value_off if verdict.category == "value" else None)
 
     def _obstructed(self, canvas: np.ndarray, mask: np.ndarray, now: float) -> bool:
         cfg = self.cfg
@@ -184,19 +206,36 @@ class Watcher:
         return False
 
     @staticmethod
-    def _value_verdict(delta_l: float) -> Verdict:
-        if delta_l < 0:
-            text = "The paint is too dark: mix in more titanium white and lighten it."
-        else:
-            text = "The paint is too light: add a little darker pigment to the mix."
-        return Verdict(verdict="ADJUST", category="value", adjustment=text)
+    def _value_verdict(step: Step, m: cvmod.Measurement) -> Verdict:
+        return Verdict(verdict="ADJUST", category="value",
+                       adjustment=mixfix.advise(step, m.mean_l_canvas, m.mean_l_ref))
 
-    def _correct(self, step, verdict, source, missing, now) -> Event:
+    def _correct(self, step, verdict, source, now, missing=None, off_value=None) -> Event:
         status = self.machine.submit(verdict)
+        if status == "stuck":
+            revised = self._try_replan(step)
+            if revised:
+                self._reset_step()
+                self._checked = self._prev   # give the painter time to act: no re-check until the canvas changes
+                return Event("replanned", step.index, verdict, source, now=now, new_steps=revised)
         kind = "stuck" if status == "stuck" else "correction"
-        return Event(kind, step.index, verdict, source, missing, now)
+        return Event(kind, step.index, verdict, source, missing, off_value, now)
+
+    def _try_replan(self, step: Step) -> list[Step] | None:
+        """On a stuck step, ask for a revised plan once; any failure falls back to plain 'stuck'."""
+        if self._replan is None or step.index in self._replanned:
+            return None
+        self._replanned.add(step.index)
+        position = self.machine.state["current"]
+        canvas = self._last_canvas if self._last_canvas is not None else np.zeros((8, 8, 3), np.uint8)
+        try:
+            revised = self._replan(position, self.machine.state["history"], canvas)
+        except Exception:
+            return None
+        self.machine.replace_remaining(revised)
+        return revised
 
     def _advance(self, step, verdict, now) -> Event:
         status = self.machine.submit(verdict)
         self._reset_step()
-        return Event("complete" if status == "complete" else "advanced", step.index, verdict, "gemini", None, now)
+        return Event("complete" if status == "complete" else "advanced", step.index, verdict, "gemini", now=now)

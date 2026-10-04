@@ -172,6 +172,11 @@ Spikes owned: **D**
   free, and authoritative for those two. Gemini is called only to confirm a step
   that looks complete, and may only object about stroke direction. Corrections
   need two agreeing measurements and are not repeated until the canvas changes.
+  Value corrections give a concrete fix ("mix in about 2 parts of titanium white to
+  your 10-part mix", `track2/mixfix.py`) and a map of the off-value areas to project.
+  A step still wrong after 3 corrections is re-planned once by Gemini (same masks,
+  revised mix/technique) instead of just going stuck. A hand/brush guard skips
+  captures with unexpected skin colour or change outside the step's region.
   Needs from Track 1: a cheap frame for motion (no projector flash) plus the
   existing flash-lit `capture_canvas()` for measurement. Thresholds in
   `WatchConfig` are rig-dependent and need tuning on the real camera.

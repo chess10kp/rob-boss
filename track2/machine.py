@@ -49,6 +49,13 @@ class StepMachine:
             return "stuck"
         return "retry"
 
+    def replace_remaining(self, new_steps: list[Step]) -> None:
+        """Swap the current step and everything after it for a revised plan; reset tries."""
+        cur = self.state["current"]
+        self.steps = self.steps[:cur] + list(new_steps)
+        self.state.update(tries=0, status="active")
+        self.state["history"].append({"step": cur + 1, "replanned": len(new_steps)})
+
     def skip(self) -> str:
         """Painter (or demo operator) moves on from a stuck step."""
         if self.status != "stuck":

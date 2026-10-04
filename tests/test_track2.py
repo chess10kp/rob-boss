@@ -136,6 +136,31 @@ class MockLayersAndPlannerTest(unittest.TestCase):
         self.assertGreater(sum(steps[0].target_rgb), sum(steps[-1].target_rgb))  # reversed order: lightest first
         self.assertNotEqual(steps[0].target_rgb, steps[-1].target_rgb)
 
+    def test_replan_revises_remaining_steps_over_the_same_masks(self) -> None:
+        scene = self.dir / "scene"
+        masks = make_value_masks(self.ref, scene, size=(120, 80))
+        ids = [m.stem for m in masks]
+        first = PlanDraft(steps=[draft_step(i) for i in ids])
+        with mock.patch.object(planner.gemini, "generate", return_value=first):
+            steps = planner.plan(self.ref, masks, scene_dir=scene, client=object())
+        stuck_pos = 2
+        remaining_ids = [Path(s.mask_path).stem for s in steps[stuck_pos:]]
+        bad = PlanDraft(steps=[draft_step(remaining_ids[0])])                      # drops two masks
+        good = PlanDraft(steps=[draft_step(i, "burnt umber") for i in reversed(remaining_ids)])
+        replies = iter([bad, good])
+        history = [{"step": 3, "verdict": "ADJUST", "category": "value", "adjustment": "Lighten it."},
+                   {"step": 1, "verdict": "ADJUST", "category": "coverage", "adjustment": "unrelated"}]
+        with mock.patch.object(planner.gemini, "generate", side_effect=lambda *a, **k: next(replies)) as gen:
+            new = planner.replan(self.ref, self.ref, steps, stuck_pos, history, scene_dir=scene, client=object())
+        self.assertEqual(gen.call_count, 2)                                        # invalid first, then fixed
+        retry_prompt = gen.call_args_list[1].args[1][0]
+        self.assertIn("invalid", retry_prompt)
+        self.assertIn("Lighten it.", retry_prompt)                                 # this step's corrections are shown
+        self.assertNotIn("unrelated", retry_prompt)                                # other steps' are not
+        self.assertEqual([s.index for s in new], [3, 4, 5])                        # continues after finished steps
+        self.assertEqual(sorted(Path(s.mask_path).stem for s in new), sorted(remaining_ids))
+        self.assertEqual(new[0].mask_path, f"layers/{remaining_ids[-1]}.png")
+
     def test_planner_gives_up_after_max_tries(self) -> None:
         masks = make_value_masks(self.ref, self.dir / "scene", size=(120, 80))
         bad = PlanDraft(steps=[draft_step(m.stem, "unobtainium") for m in masks])

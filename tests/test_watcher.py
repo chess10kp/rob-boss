@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from track2 import cv as cvmod
+from track2 import mixfix
 from track2.cv import DEFAULT_BARE_RGB, measure
 from track2.machine import StepMachine
 from track2.schema import Step, Verdict
@@ -70,6 +71,55 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(cvmod.estimate_bare_rgb(np.full((4, 4, 3), (200, 190, 180), np.uint8)), (200, 190, 180))
 
 
+class MachineReplaceTest(unittest.TestCase):
+    def test_replace_remaining_keeps_finished_steps_and_resets_tries(self) -> None:
+        m = StepMachine([make_step(1, "a"), make_step(2, "b"), make_step(3, "c")])
+        m.submit(READY)
+        for _ in range(3):
+            m.submit(Verdict(verdict="ADJUST", category="value", adjustment="x"))
+        self.assertEqual(m.status, "stuck")
+        m.replace_remaining([make_step(2, "b2"), make_step(3, "c2")])
+        self.assertEqual((m.status, m.state["tries"], [s.name for s in m.steps]), ("active", 0, ["a", "b2", "c2"]))
+        self.assertEqual(m.current.name, "b2")
+
+
+class MixFixTest(unittest.TestCase):
+    def test_added_parts_reach_the_reference_lightness(self) -> None:
+        t, lc, lr, lp = 10, 50.0, 60.0, 96.0
+        p = mixfix.parts_to_add(t, lc, lr, lp)
+        self.assertAlmostEqual((t * lc + p * lp) / (t + p), lr, places=6)
+
+    def test_capped_and_unreachable_cases_never_exceed_the_mix(self) -> None:
+        self.assertEqual(mixfix.parts_to_add(10, 20.0, 80.0, 96.0), 10.0)   # would need >10 parts: capped
+        self.assertEqual(mixfix.parts_to_add(10, 50.0, 60.0, 12.0), 10.0)   # black cannot lighten
+
+    def test_part_formatting(self) -> None:
+        self.assertEqual([mixfix.fmt_parts(x) for x in (0.1, 1.0, 1.5, 2.0, 0.9)],
+                         ["half a part", "1 part", "1.5 parts", "2 parts", "1 part"])
+
+    def test_advice_picks_white_to_lighten_and_the_mixs_darkest_to_darken(self) -> None:
+        step = Step(**{**make_step(1, "sky").model_dump(),
+                       "mix": [{"pigment": "titanium white", "parts": 4},
+                               {"pigment": "ultramarine blue", "parts": 2}]})
+        self.assertIn("titanium white", mixfix.advise(step, 40.0, 60.0))
+        self.assertIn("too dark", mixfix.advise(step, 40.0, 60.0))
+        self.assertIn("ultramarine blue", mixfix.advise(step, 70.0, 50.0))
+        self.assertIn("6-part mix", mixfix.advise(step, 70.0, 50.0))
+
+
+class ValueMapTest(unittest.TestCase):
+    def test_map_points_at_the_too_dark_half_only(self) -> None:
+        ref = make_ref()
+        mask = np.zeros((H, W), np.uint8)
+        mask[:H // 2] = 255
+        canvas = paint(ref, mask)
+        canvas[:H // 2, :W // 2] = (canvas[:H // 2, :W // 2] * 0.4).astype(np.uint8)  # left half too dark
+        m = measure(canvas, ref, mask, blur_px=9)
+        off = m.value_off
+        self.assertGreater(off[:H // 2, :W // 4].mean(), 0.9)       # left: flagged
+        self.assertLess(off[:H // 2, 3 * W // 4:].mean(), 0.05)      # right: fine
+
+
 class WatcherTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -124,7 +174,10 @@ class WatcherTest(unittest.TestCase):
         events = run(w, self.feed, [(paint(self.ref, self.masks[0], scale=0.5), 1.0, 10.0)])
         self.assertEqual([(e.kind, e.verdict.category, e.source) for _, e in events],
                          [("correction", "value", "cv")])
-        self.assertIn("too dark", events[0][1].verdict.adjustment)
+        ev = events[0][1]
+        self.assertIn("too dark", ev.verdict.adjustment)
+        self.assertIn("part", ev.verdict.adjustment)          # a concrete mix fix, not just "lighten"
+        self.assertTrue(ev.off_value.any() and ev.missing is None)  # a map of where, for the projector
         self.assertEqual(self.calls, 0)
 
     def test_correction_is_not_repeated_until_the_canvas_changes(self) -> None:
@@ -174,6 +227,54 @@ class WatcherTest(unittest.TestCase):
             kinds += [e.kind for _, e in ev]
             t += 20.0
         self.assertEqual(kinds, ["correction", "correction", "stuck"])
+        self.assertEqual(w.machine.status, "stuck")
+
+    def _stuck_run(self, w: Watcher):
+        kinds, t = [], 0.0
+        for scale in (0.5, 0.45, 0.4):
+            ev = run(w, self.feed, [(paint(self.ref, self.masks[0], scale=scale), 1.0, 12.0)], t0=t)
+            kinds += [e for _, e in ev]
+            t += 20.0
+        return kinds
+
+    def test_stuck_step_is_replanned_once_and_the_session_continues(self) -> None:
+        revised = [make_step(1, "sky, simpler"), make_step(2, "ground")]
+        asked = []
+
+        def replan(position, history, canvas):
+            asked.append((position, len(history), canvas.shape))
+            return revised
+
+        w = self.watcher()
+        w._replan = replan
+        events = self._stuck_run(w)
+        self.assertEqual([e.kind for e in events], ["correction", "correction", "replanned"])
+        self.assertEqual(events[-1].new_steps, revised)
+        self.assertEqual((w.machine.status, w.machine.state["tries"], w.machine.current.name),
+                         ("active", 0, "sky, simpler"))
+        self.assertEqual(asked[0][0], 0)
+        self.assertEqual(asked[0][2][:2], (H, W))                  # got the last real canvas, not a dummy
+
+    def test_second_stuck_on_the_same_step_is_not_replanned_again(self) -> None:
+        w = self.watcher()
+        w._replan = lambda *a: [make_step(1, "sky, simpler"), make_step(2, "ground")]
+        self._stuck_run(w)                                          # first stuck -> replanned
+        kinds, t = [], 100.0
+        for scale in (0.35, 0.3, 0.25):
+            ev = run(w, self.feed, [(paint(self.ref, self.masks[0], scale=scale), 1.0, 12.0)], t0=t)
+            kinds += [e.kind for _, e in ev]
+            t += 20.0
+        self.assertEqual(kinds, ["correction", "correction", "stuck"])
+        self.assertEqual(w.machine.status, "stuck")
+
+    def test_a_failing_replan_falls_back_to_stuck(self) -> None:
+        def boom(*a):
+            raise RuntimeError("api down")
+
+        w = self.watcher()
+        w._replan = boom
+        events = self._stuck_run(w)
+        self.assertEqual([e.kind for e in events], ["correction", "correction", "stuck"])
         self.assertEqual(w.machine.status, "stuck")
 
     def test_full_two_step_session_completes(self) -> None:
