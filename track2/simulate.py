@@ -18,6 +18,8 @@ class SimFeed:
         self.canvas = np.full((h, w, 3), DEFAULT_BARE_RGB, np.uint8)
         self._n = 0
         self.resting_hand = False   # a still hand in view: shows in both peek and capture
+        self.rest_at = (0.5, 0.25)  # where the resting hand lies (fractions of width, height)
+        self.hand_box = (0.2, 0.8, 0.2, 0.8)  # where the moving hand roams: x0, x1, y0, y1 fractions
 
     def set(self, canvas_rgb: np.ndarray) -> None:
         self.canvas = canvas_rgb.astype(np.uint8)
@@ -25,7 +27,8 @@ class SimFeed:
     def _rest(self, frame: np.ndarray) -> np.ndarray:
         if self.resting_hand:
             h, w = frame.shape[:2]
-            cv2.ellipse(frame, (w // 2, h // 4), (w // 6, h // 5), 0, 0, 360, (40, 60, 90), -1)
+            cv2.ellipse(frame, (int(w * self.rest_at[0]), int(h * self.rest_at[1])), (w // 6, h // 5),
+                        0, 0, 360, (40, 60, 90), -1)
         return frame
 
     def peek(self, hand: bool = False) -> np.ndarray:
@@ -33,8 +36,9 @@ class SimFeed:
         if hand:
             self._n += 1
             h, w = frame.shape[:2]
-            cx = int(w * (0.2 + 0.6 * ((self._n * 0.37) % 1.0)))
-            cy = int(h * (0.2 + 0.6 * ((self._n * 0.61) % 1.0)))
+            x0, x1, y0, y1 = self.hand_box
+            cx = int(w * (x0 + (x1 - x0) * ((self._n * 0.37) % 1.0)))
+            cy = int(h * (y0 + (y1 - y0) * ((self._n * 0.61) % 1.0)))
             cv2.ellipse(frame, (cx, cy), (w // 8, h // 6), 0, 0, 360, (40, 60, 90), -1)
         return frame
 

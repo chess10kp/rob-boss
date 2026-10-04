@@ -67,6 +67,17 @@ class MeasureTest(unittest.TestCase):
         blank_ref = np.full_like(self.ref, DEFAULT_BARE_RGB)
         self.assertFalse(measure(blank_ref, blank_ref, self.mask).checkable)
 
+    def test_uneven_light_on_bare_canvas_is_not_paint_with_a_bare_capture(self) -> None:
+        ref = make_ref()
+        mask = np.zeros((H, W), np.uint8)
+        mask[:H // 2] = 255
+        falloff = np.linspace(1.0, 0.55, W)[None, :, None]          # brighter on the left, dim on the right
+        bare = np.clip(np.full((H, W, 3), DEFAULT_BARE_RGB, np.float32) * falloff, 0, 255).astype(np.uint8)
+        naive = measure(bare, ref, mask, bare_rgb=tuple(int(v) for v in np.median(bare.reshape(-1, 3), 0)))
+        per_px = measure(bare, ref, mask, bare_image=bare)
+        self.assertGreater(naive.coverage, 0.2)                      # dim paper counted as paint
+        self.assertEqual(per_px.coverage, 0.0)                       # nothing painted
+
     def test_calibrates_bare_canvas_colour(self) -> None:
         self.assertEqual(cvmod.estimate_bare_rgb(np.full((4, 4, 3), (200, 190, 180), np.uint8)), (200, 190, 180))
 
@@ -156,7 +167,7 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual([e.kind for _, e in events], ["advanced"])
         self.assertEqual(self.calls, 1)
         self.assertEqual(w.machine.current.index, 2)
-        self.assertGreaterEqual(events[0][0], 2.0 + 1.5)  # not before the settle time
+        self.assertGreaterEqual(events[0][0], 2.0 + w.cfg.settle_s)  # not before the settle time
 
     def test_progress_midstroke_is_quiet_then_idle_gives_coverage_correction(self) -> None:
         w = self.watcher()
@@ -211,12 +222,34 @@ class WatcherTest(unittest.TestCase):
 
     def test_change_outside_the_step_region_is_an_obstruction_for_a_while(self) -> None:
         w = self.watcher()
+        w.cfg.outside_change_blocks = True                       # opt-in: off by default
         step1 = paint(self.ref, self.masks[0])
-        run(w, self.feed, [(paint(self.ref, self.masks[0], rows_frac=0.2), 1.0, 3.0)])  # a first accepted capture
+        run(w, self.feed, [(paint(self.ref, self.masks[0], rows_frac=0.2), 1.0, 5.0)])  # a first accepted capture
         stray = step1.copy()
         stray[H // 2 + 5:H - 5, 10:W - 10] = (30, 30, 30)       # something dark lying on the later step's area
-        events = run(w, self.feed, [(stray, 1.0, 8.0)], t0=10.0)
+        events = run(w, self.feed, [(stray, 1.0, 8.0)], t0=12.0)
         self.assertEqual((events, self.calls), ([], 0))          # skipped, not judged
+
+    def test_hand_resting_outside_the_region_does_not_hold_the_check_up(self) -> None:
+        w = self.watcher()
+        self.feed.rest_at = (0.5, 0.85)                          # on step 2's area, step 1 is current
+        events = run(w, self.feed, [(paint(self.ref, self.masks[0]), 1.0, 6.0)])
+        self.assertEqual([e.kind for _, e in events], ["advanced"])
+
+    def test_hand_moving_outside_the_region_does_not_reset_the_settle_timer(self) -> None:
+        w = self.watcher()
+        done = paint(self.ref, self.masks[0])
+        run(w, self.feed, [(done, 1.0, 0.5)])                    # works in the region, then leaves
+        self.feed.hand_box = (0.3, 0.7, 0.9, 1.0)                # keeps moving, low on step 2's area
+        events = run(w, self.feed, [(done, 4.0, 0.0)], t0=1.5)   # still moving there the whole time
+        self.assertEqual([e.kind for _, e in events], ["advanced"])
+        self.assertLessEqual(events[0][0], 1.5 + w.cfg.settle_s + 1.0)  # ~2.5 s after leaving the region
+
+    def test_hand_moving_inside_the_region_keeps_resetting_it(self) -> None:
+        w = self.watcher()
+        self.feed.hand_box = (0.3, 0.7, 0.1, 0.3)                # inside step 1's region
+        events = run(w, self.feed, [(paint(self.ref, self.masks[0]), 20.0, 0.0)])
+        self.assertEqual((events, self.calls), ([], 0))
 
     def test_stuck_after_three_corrections(self) -> None:
         w = self.watcher()

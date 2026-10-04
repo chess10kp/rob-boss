@@ -161,6 +161,56 @@ class MockLayersAndPlannerTest(unittest.TestCase):
         self.assertEqual(sorted(Path(s.mask_path).stem for s in new), sorted(remaining_ids))
         self.assertEqual(new[0].mask_path, f"layers/{remaining_ids[-1]}.png")
 
+    def make_stack_scene(self) -> tuple[Path, list[Path]]:
+        """A minimal track3.layers scene: masks/ plus report.json, stack order 01 -> 03."""
+        import json
+        scene = self.dir / "stack"
+        (scene / "masks").mkdir(parents=True)
+        h, w = 80, 120
+        rows = [("01_ground-wash", "base", 0.55, slice(0, h)), ("02_sky", "sky", 0.9, slice(0, 40)),
+                ("03_hill", "near", 1.0, slice(40, h))]
+        steps, masks = [], []
+        for i, (stem, role, opacity, ys) in enumerate(rows, 1):
+            m = np.zeros((h, w), np.uint8)
+            m[ys] = 255
+            path = scene / "masks" / f"{stem}.png"
+            Image.fromarray(m).save(path)
+            masks.append(path)
+            steps.append({"index": i, "name": stem[3:].title(), "role": role, "opacity": opacity,
+                          "mask_path": f"masks/{stem}.png", "painted_coverage": 0.5, "visible_coverage": 0.4,
+                          "stroke_dir_deg": 3.0})
+        (scene / "report.json").write_text(json.dumps({"steps": steps}))
+        return scene, masks
+
+    def test_planner_keeps_track3_stack_order(self) -> None:
+        scene, masks = self.make_stack_scene()
+        ids = [m.stem for m in masks]
+        reordered = PlanDraft(steps=[draft_step(i) for i in reversed(ids)])     # valid otherwise
+        in_order = PlanDraft(steps=[draft_step(i) for i in ids])
+        replies = iter([reordered, in_order])
+        with mock.patch.object(planner.gemini, "generate", side_effect=lambda *a, **k: next(replies)) as gen:
+            steps = planner.plan(self.ref, list(reversed(masks)), scene_dir=scene, client=object())
+        self.assertEqual(gen.call_count, 2)
+        first_prompt, retry_prompt = gen.call_args_list[0].args[1][0], gen.call_args_list[1].args[1][0]
+        self.assertIn("back-to-front", first_prompt)                               # told it is a stack
+        self.assertIn('"opacity": 0.55', first_prompt)                             # Track 3 facts reach Gemini
+        self.assertIn("exact order", retry_prompt)                                 # reordering was rejected
+        self.assertEqual([Path(s.mask_path).stem for s in steps], ids)
+        self.assertEqual(steps[0].mask_path, "masks/01_ground-wash.png")
+
+    def test_replan_on_a_stack_keeps_order(self) -> None:
+        scene, masks = self.make_stack_scene()
+        ids = [m.stem for m in masks]
+        with mock.patch.object(planner.gemini, "generate", return_value=PlanDraft(steps=[draft_step(i) for i in ids])):
+            steps = planner.plan(self.ref, masks, scene_dir=scene, client=object())
+        replies = iter([PlanDraft(steps=[draft_step(i) for i in reversed(ids[1:])]),
+                        PlanDraft(steps=[draft_step(i, "burnt umber") for i in ids[1:]])])
+        with mock.patch.object(planner.gemini, "generate", side_effect=lambda *a, **k: next(replies)) as gen:
+            new = planner.replan(self.ref, self.ref, steps, 1, [], scene_dir=scene, client=object())
+        self.assertIn("keep their order", gen.call_args_list[0].args[1][0])
+        self.assertEqual([Path(s.mask_path).stem for s in new], ids[1:])
+        self.assertEqual([s.index for s in new], [2, 3])
+
     def test_planner_gives_up_after_max_tries(self) -> None:
         masks = make_value_masks(self.ref, self.dir / "scene", size=(120, 80))
         bad = PlanDraft(steps=[draft_step(m.stem, "unobtainium") for m in masks])

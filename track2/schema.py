@@ -53,12 +53,16 @@ class PlanDraft(BaseModel):
     steps: list[StepDraft]
 
 
-def validate_draft(draft: PlanDraft, mask_ids: list[str]) -> list[str]:
-    """Return a list of violations (empty = valid). Fed back to Gemini on retry."""
+def validate_draft(draft: PlanDraft, mask_ids: list[str], keep_order: bool = False) -> list[str]:
+    """Return a list of violations (empty = valid). Fed back to Gemini on retry.
+    keep_order: the steps must be in exactly mask_ids' order (Track 3 layer stacks)."""
     errors: list[str] = []
     got = [s.mask_id for s in draft.steps]
     if sorted(got) != sorted(mask_ids):
         errors.append(f"steps must use each of {mask_ids} exactly once, got {got}")
+    elif keep_order and got != list(mask_ids):
+        errors.append(f"steps must stay in this exact order (later layers paint over earlier ones): "
+                      f"{mask_ids}, got {got}")
     for s in draft.steps:
         tag = f"{s.mask_id}"
         if not s.mix:

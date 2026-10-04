@@ -3,9 +3,11 @@
 No button. `Watcher.tick(frame, now)` is called a few times a second with a cheap frame
 and decides what, if anything, to do:
 
-  1. Motion gate (debounce): any frame-to-frame change means the painter (hand/brush) is
-     active; do nothing. A check is only considered after the canvas has been still for
-     `settle_s`, and only if it changed since the last check.
+  1. Motion gate (debounce): frame-to-frame change inside the current step's region (grown
+     by `region_margin`) means the painter (hand/brush) is working there; do nothing. A
+     check is only considered once that area has been still for `settle_s` - i.e. that long
+     after the hand leaves the region - and only if it changed since the last check. A hand
+     moving or resting elsewhere does not hold the check up.
   2. Local CV (cv.py): measure coverage and value inside the step's mask. Cheap and exact,
      so it runs on every settled change and never calls the API.
        - value off (once enough is painted)  -> value correction
@@ -18,12 +20,13 @@ and decides what, if anything, to do:
   4. After a correction nothing more is said until the canvas changes (no flip-flop). A step
      that is still wrong after `max_tries` corrections is re-planned once (replan_fn) instead of
      just going stuck; if that fails, or it gets stuck again, the machine stays stuck.
-  5. Before measuring, a hand/brush guard (cv.occlusion) skips captures that contain skin-coloured
-     pixels the reference lacks, or change outside the step's region; it retries shortly.
+  5. Before measuring, a hand/brush guard (cv.occlusion) skips captures with skin-coloured
+     pixels the reference lacks inside the grown region; it retries shortly. Optionally
+     (`outside_change_blocks`) any change outside the region also counts as an obstruction.
 
-Frames are BGR uint8 arrays, matching track1.Rig. `peek` frames feed the motion gate and
-should be cheap (no projector flash); `capture()` is the accurate flash-lit canvas capture,
-called only when a check is actually due.
+Frames are BGR uint8 arrays in canvas space (rectified, like track1.Rig.capture_canvas), so
+the step's mask applies to them. `peek` frames feed the motion gate and should be cheap (no
+projector flash); `capture()` is the accurate flash-lit capture, called only when a check is due.
 """
 from __future__ import annotations
 
@@ -43,8 +46,9 @@ from track2.schema import Step, Verdict
 
 @dataclass
 class WatchConfig:
-    settle_s: float = 1.5          # canvas must be still this long before any check
-    motion_t: float = 2.0          # mean abs gray diff (0-255) above which the painter is "active"
+    settle_s: float = 2.5          # the step's region must be still this long before any check
+    motion_t: float = 2.0          # mean abs gray diff (0-255) in the region above which the painter is "active"
+    region_margin: float = 0.08    # region grown by this fraction of canvas width for motion and hands
     change_t: float = 1.5          # diff vs the last checked frame that counts as "changed"
     idle_coverage_s: float = 6.0   # pause needed before "unpainted area" is a mistake, not progress
     confirm_gap_s: float = 2.0     # CV corrections must hold across two measurements this far apart
@@ -56,6 +60,8 @@ class WatchConfig:
     outside_change_t: float = 0.03  # canvas fraction changed outside the step region = something in the way
     recheck_gap_s: float = 1.0     # retry this soon after skipping an occluded capture
     occlusion_max_s: float = 12.0  # after this, stop treating outside-region change as an obstruction
+    outside_change_blocks: bool = False  # treat change outside the region as an obstruction (off:
+                                         # a hand resting elsewhere must not hold the check up)
 
 
 @dataclass
@@ -106,16 +112,20 @@ class Watcher:
                  replan_fn: ReplanFn | None = None):
         self.machine, self.ref, self.scene_dir = machine, ref_rgb, Path(scene_dir)
         self.capture, self.cfg, self.bare_rgb = capture, config or WatchConfig(), bare_rgb
+        self.bare_image: np.ndarray | None = None
         self._critique = critique_fn or default_critique(ref_rgb)
         self._replan = replan_fn
         self._replanned: set[int] = set()   # step indexes already re-planned once: never loop
         self._masks: dict[int, np.ndarray] = {}
+        self._grown: dict[int, np.ndarray] = {}
         self._reset_step()
         self._prev: np.ndarray | None = None
 
     def calibrate(self, empty_canvas_bgr: np.ndarray) -> None:
-        """Learn the bare-canvas colour from a capture of the empty canvas."""
-        self.bare_rgb = cvmod.estimate_bare_rgb(cv2.cvtColor(empty_canvas_bgr, cv2.COLOR_BGR2RGB))
+        """Learn the bare canvas from a capture of it empty: its colour, and per pixel how it looks."""
+        rgb = cv2.cvtColor(empty_canvas_bgr, cv2.COLOR_BGR2RGB)
+        self.bare_rgb = cvmod.estimate_bare_rgb(rgb)
+        self.bare_image = rgb            # per-pixel: the capture light is not even across the canvas
 
     def _reset_step(self) -> None:
         self._still_since: float | None = None
@@ -130,6 +140,22 @@ class Watcher:
             self._masks[step.index] = np.asarray(Image.open(self.scene_dir / step.mask_path).convert("L"))
         return self._masks[step.index]
 
+    def _grown_region(self, step: Step) -> np.ndarray:
+        """The step's region grown by region_margin (bool, mask size): where hands and motion count."""
+        if step.index not in self._grown:
+            mask = self._mask(step) > 127
+            r = max(1, int(round(self.cfg.region_margin * mask.shape[1])))
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+            self._grown[step.index] = cv2.dilate(mask.astype(np.uint8), k).astype(bool)
+        return self._grown[step.index]
+
+    def _motion(self, small: np.ndarray, prev: np.ndarray, step: Step) -> float:
+        """Mean frame-to-frame change inside the grown region (whole frame if it is empty)."""
+        region = cv2.resize(self._grown_region(step).astype(np.uint8), small.shape[::-1],
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+        diff = np.abs(small - prev)
+        return float(diff[region].mean()) if region.any() else float(diff.mean())
+
     def tick(self, peek_bgr: np.ndarray, now: float) -> Event | None:
         cfg, step = self.cfg, self.machine.current
         small = _small_gray(peek_bgr)
@@ -137,7 +163,7 @@ class Watcher:
         if step is None or self.machine.status != "active" or prev is None:
             return None
 
-        if float(np.abs(small - prev).mean()) > cfg.motion_t:      # painter active -> debounce
+        if self._motion(small, prev, step) > cfg.motion_t:         # painter active in the region -> debounce
             self._still_since = None
             return None
         if self._still_since is None:
@@ -152,10 +178,11 @@ class Watcher:
 
         mask = self._mask(step)
         canvas = cv2.cvtColor(self.capture(), cv2.COLOR_BGR2RGB)
-        if self._obstructed(canvas, mask, now):                     # hand/brush in the way: look again soon
+        if self._obstructed(canvas, mask, step, now):               # hand/brush in the way: look again soon
             self._recheck_at = now + cfg.recheck_gap_s
             return None
-        m = cvmod.measure(canvas, self.ref, mask, bare_rgb=self.bare_rgb, paint_de=cfg.paint_de, value_dl=cfg.value_dl)
+        m = cvmod.measure(canvas, self.ref, mask, bare_rgb=self.bare_rgb, bare_image=self.bare_image,
+                          paint_de=cfg.paint_de, value_dl=cfg.value_dl)
 
         verdict, source = None, "cv"
         if m.checkable and m.delta_l is not None and m.coverage >= cfg.min_cov_for_value \
@@ -190,13 +217,14 @@ class Watcher:
                              missing=m.missing if verdict.category == "coverage" else None,
                              off_value=m.value_off if verdict.category == "value" else None)
 
-    def _obstructed(self, canvas: np.ndarray, mask: np.ndarray, now: float) -> bool:
+    def _obstructed(self, canvas: np.ndarray, mask: np.ndarray, step: Step, now: float) -> bool:
         cfg = self.cfg
-        occ = cvmod.occlusion(canvas, self.ref, mask, self._last_canvas)
+        occ = cvmod.occlusion(canvas, self.ref, mask, self._last_canvas if cfg.outside_change_blocks else None,
+                              within=self._grown_region(step))
         if occ.skin_frac > cfg.skin_frac_t:
             self._occluded_since = self._occluded_since if self._occluded_since is not None else now
             return True
-        if occ.outside_change_frac > cfg.outside_change_t:
+        if cfg.outside_change_blocks and occ.outside_change_frac > cfg.outside_change_t:
             if self._occluded_since is None:
                 self._occluded_since = now
             if now - self._occluded_since < cfg.occlusion_max_s:

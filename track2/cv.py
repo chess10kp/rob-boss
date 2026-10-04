@@ -45,7 +45,8 @@ def estimate_bare_rgb(canvas_rgb: np.ndarray) -> tuple[int, int, int]:
 
 
 def measure(canvas_rgb: np.ndarray, ref_rgb: np.ndarray, mask: np.ndarray, *,
-            bare_rgb=DEFAULT_BARE_RGB, paint_de: float = 12.0, erode_px: int = 5,
+            bare_rgb=DEFAULT_BARE_RGB, bare_image: np.ndarray | None = None,
+            paint_de: float = 12.0, erode_px: int = 5,
             min_needed_px: int = 200, min_painted_px: int = 50,
             value_dl: float = 12.0, blur_px: int = 25) -> Measurement:
     h, w = mask.shape[:2]
@@ -56,7 +57,11 @@ def measure(canvas_rgb: np.ndarray, ref_rgb: np.ndarray, mask: np.ndarray, *,
         region = cv2.erode(region.astype(np.uint8), np.ones((erode_px, erode_px), np.uint8)).astype(bool)
 
     lab_c, lab_r, lab_b = to_lab(canvas), to_lab(ref), bare_lab(bare_rgb)
-    painted_any = np.linalg.norm(lab_c - lab_b, axis=2) > paint_de
+    # Painted = changed from bare. With a capture of the empty canvas (bare_image), compare
+    # each pixel with that same spot bare: the capture light is not even (brighter centre,
+    # darker edges), so one bare colour would count dim-but-bare paper as paint.
+    lab_bare_px = lab_b if bare_image is None else         to_lab(cv2.resize(bare_image, (w, h), interpolation=cv2.INTER_AREA))
+    painted_any = np.linalg.norm(lab_c - lab_bare_px, axis=2) > paint_de
     needs_paint = region & (np.linalg.norm(lab_r - lab_b, axis=2) > paint_de)
 
     if needs_paint.sum() < min_needed_px:
@@ -98,19 +103,23 @@ def _skin_like(rgb: np.ndarray) -> np.ndarray:
 
 def occlusion(canvas_rgb: np.ndarray, ref_rgb: np.ndarray, mask: np.ndarray,
               last_rgb: np.ndarray | None = None, *, change_de: float = 25.0,
-              margin_px: int = 15) -> Occlusion:
+              margin_px: int = 15, within: np.ndarray | None = None) -> Occlusion:
     """Is something other than paint (a hand, brush, palette) in the capture?
 
     Two signals. Skin-coloured pixels that the reference does not have there (so orange sky
     is not mistaken for a hand). And change outside the current step's region compared with
     the last accepted capture: earlier steps are finished and later ones are bare, so
     nothing legitimate should change there. A hand lying over a skin-coloured part of the
-    reference is not detectable by colour.
+    reference is not detectable by colour. `within` (bool, any size) limits the skin signal
+    to that area, e.g. the step's region plus a margin.
     """
     h, w = mask.shape[:2]
     canvas = cv2.resize(canvas_rgb, (w, h), interpolation=cv2.INTER_AREA)
     ref = cv2.resize(ref_rgb, (w, h), interpolation=cv2.INTER_AREA)
-    bad = (_skin_like(canvas) & ~_skin_like(ref)).astype(np.uint8)
+    bad = _skin_like(canvas) & ~_skin_like(ref)
+    if within is not None:   # only skin in this area counts (the step's region plus a margin)
+        bad &= cv2.resize(within.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+    bad = bad.astype(np.uint8)
     skin_frac = float(cv2.erode(bad, np.ones((3, 3), np.uint8)).mean())
 
     outside_frac = 0.0
