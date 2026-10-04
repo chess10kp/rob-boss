@@ -52,6 +52,8 @@ def landing_error(rig, mask):
     iou = (want & got).sum() / max(1, (want | got).sum())
     # distance from each seen-boundary pixel to the intended boundary (canvas px ~ projector px)
     edge = lambda m: cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
+    if not edge(want).any():                     # e.g. a full-canvas ground wash: no boundary to compare
+        return iou, np.array([]), lit, seen
     dist = cv2.distanceTransform((~edge(want)).astype(np.uint8), cv2.DIST_L2, 5)[edge(got)]
     return iou, dist, lit, seen
 

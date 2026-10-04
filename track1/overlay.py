@@ -16,6 +16,8 @@ import numpy as np
 DEFAULT_STYLE = {
     "fill": True,              # region fill
     "fill_rgb": (255, 255, 255),
+    "fill_image": None,        # path/array: fill the region with this image's colours instead of
+                               # fill_rgb (e.g. a track3.layers RGBA layer; its alpha is ignored)
     "fill_alpha": 0.35,        # fill brightness 0-1 (it's light, not paint: 1 = full colour)
     "outline": True,           # boundary lines
     "outline_rgb": (255, 255, 255),
@@ -79,7 +81,15 @@ def render(mask, style=None, size=None):
         m = cv2.resize(m, tuple(size), interpolation=cv2.INTER_LINEAR)
     region = m > 127
     img = np.zeros((*region.shape, 3), np.uint8)
-    if st["fill"]:
+    if st["fill"] and st["fill_image"] is not None:
+        src = st["fill_image"]
+        src = cv2.imread(str(src), cv2.IMREAD_COLOR) if isinstance(src, (str, Path)) else np.asarray(src)[..., :3]
+        if src is None:
+            raise FileNotFoundError(st["fill_image"])
+        if src.shape[:2] != region.shape:
+            src = cv2.resize(src, (region.shape[1], region.shape[0]), interpolation=cv2.INTER_AREA)
+        img[region] = (src[region].astype(np.float32) * float(st["fill_alpha"])).astype(np.uint8)
+    elif st["fill"]:
         img[region] = np.array(bgr(st["fill_rgb"]), np.float32) * float(st["fill_alpha"])
     if st["arrows"]:
         draw_arrows(img, region, float(st["stroke_dir_deg"]), float(st["arrow_spacing_px"]),

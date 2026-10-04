@@ -111,6 +111,15 @@ class OverlayTest(unittest.TestCase):
         ys, xs = np.nonzero(lit)
         self.assertGreater(np.ptp(xs), np.ptp(ys))                      # horizontal strokes
 
+    def test_fill_image_copies_layer_colours_inside_region(self):
+        layer = np.zeros((400, 600, 4), np.uint8)
+        layer[:, :300] = (255, 0, 0, 255)                              # BGRA: blue left half
+        layer[:, 300:] = (0, 0, 255, 128)                              # red right half, alpha ignored
+        img = overlay.render(self.mask, {"fill_image": layer, "fill_alpha": 1.0, "outline": False})
+        self.assertEqual(tuple(img[200, 150]), (255, 0, 0))
+        self.assertEqual(tuple(img[200, 350]), (0, 0, 255))
+        self.assertEqual(img[50, 50].sum(), 0)                          # outside the mask stays dark
+
     def test_render_resizes_mask(self):
         img = overlay.render(self.mask, size=(300, 200))
         self.assertEqual(img.shape, (200, 300, 3))
