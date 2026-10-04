@@ -1,4 +1,7 @@
-"""Step machine: advance / retry / stuck-after-3-tries, held in a plain dict.
+"""Step machine: advance / retry / struggling-after-3-strikes, held in a plain dict.
+
+There is no blocking "stuck" state: a step that keeps failing is reported as "struggling"
+(the watcher re-plans it once), and the painter can always move on (skip) or call it done.
 
 The dict is the whole state, so Backboard (or a JSON file) can persist it later by
 swapping `to_dict` / `from_dict` without touching the logic.
@@ -14,7 +17,7 @@ class StepMachine:
     def __init__(self, steps: list[Step], max_tries: int = MAX_TRIES, state: dict | None = None):
         self.steps = steps
         self.max_tries = max_tries
-        # status: active | stuck | complete
+        # status: active | complete
         self.state = state or {"current": 0, "tries": 0, "status": "active", "history": []}
 
     @classmethod
@@ -32,8 +35,10 @@ class StepMachine:
     def current(self) -> Step | None:
         return None if self.status == "complete" else self.steps[self.state["current"]]
 
-    def submit(self, verdict: Verdict) -> str:
-        """Apply a critique verdict. Returns the new status: advanced | retry | stuck | complete."""
+    def submit(self, verdict: Verdict, strike: bool = True) -> str:
+        """Apply a critique verdict. Returns: advanced | complete | retry | struggling.
+        `strike`: an ADJUST counts toward max_tries (False for a nudge the painter is already
+        making progress on). "struggling" means max_tries strikes on this step; it stays active."""
         if self.status != "active":
             raise RuntimeError(f"cannot submit while status is {self.status!r}")
         step = self.current
@@ -43,24 +48,21 @@ class StepMachine:
         )
         if verdict.verdict == "READY":
             return self._advance("advanced")
-        self.state["tries"] += 1
-        if self.state["tries"] >= self.max_tries:
-            self.state["status"] = "stuck"
-            return "stuck"
-        return "retry"
+        self.state["tries"] += int(strike)
+        return "struggling" if self.state["tries"] >= self.max_tries else "retry"
 
     def replace_remaining(self, new_steps: list[Step]) -> None:
         """Swap the current step and everything after it for a revised plan; reset tries."""
         cur = self.state["current"]
         self.steps = self.steps[:cur] + list(new_steps)
-        self.state.update(tries=0, status="active")
+        self.state["tries"] = 0
         self.state["history"].append({"step": cur + 1, "replanned": len(new_steps)})
 
     def skip(self) -> str:
-        """Painter (or demo operator) moves on from a stuck step."""
-        if self.status != "stuck":
-            raise RuntimeError("skip is only valid when stuck")
-        self.state["status"] = "active"
+        """Painter (or demo operator) moves on from the current step without it being done."""
+        if self.status != "active":
+            raise RuntimeError(f"cannot skip while status is {self.status!r}")
+        self.state["history"].append({"step": self.current.index, "skipped": True})
         return self._advance("advanced")
 
     def _advance(self, label: str) -> str:

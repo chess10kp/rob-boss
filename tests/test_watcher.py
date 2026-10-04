@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -14,7 +15,7 @@ from track2.cv import DEFAULT_BARE_RGB, measure
 from track2.machine import StepMachine
 from track2.schema import Step, Verdict
 from track2.simulate import SimFeed, run
-from track2.watcher import Watcher
+from track2.watcher import Watcher, _small_gray
 
 W, H = 120, 80
 READY = Verdict(verdict="READY", category="none", adjustment="")
@@ -89,7 +90,7 @@ class MachineReplaceTest(unittest.TestCase):
         m.submit(READY)
         for _ in range(3):
             m.submit(Verdict(verdict="ADJUST", category="value", adjustment="x"))
-        self.assertEqual(m.status, "stuck")
+        self.assertEqual((m.status, m.state["tries"]), ("active", 3))
         m.replace_remaining([make_step(2, "b2"), make_step(3, "c2")])
         self.assertEqual((m.status, m.state["tries"], [s.name for s in m.steps]), ("active", 0, ["a", "b2", "c2"]))
         self.assertEqual(m.current.name, "b2")
@@ -242,9 +243,9 @@ class WatcherTest(unittest.TestCase):
         done = paint(self.ref, self.masks[0])
         run(w, self.feed, [(done, 1.0, 0.5)])                    # works in the region, then leaves
         self.feed.hand_box = (0.3, 0.7, 0.9, 1.0)                # keeps moving, low on step 2's area
-        events = run(w, self.feed, [(done, 4.0, 0.0)], t0=1.5)   # still moving there the whole time
+        events = run(w, self.feed, [(done, 6.0, 0.0)], t0=1.5)   # still moving there the whole time
         self.assertEqual([e.kind for _, e in events], ["advanced"])
-        self.assertLessEqual(events[0][0], 1.5 + w.cfg.settle_s + 1.0)  # ~2.5 s after leaving the region
+        self.assertLessEqual(events[0][0], 1.5 + w.cfg.settle_s + 1.0)  # ~settle_s after leaving the region
 
     def test_hand_moving_inside_the_region_keeps_resetting_it(self) -> None:
         w = self.watcher()
@@ -252,7 +253,7 @@ class WatcherTest(unittest.TestCase):
         events = run(w, self.feed, [(paint(self.ref, self.masks[0]), 20.0, 0.0)])
         self.assertEqual((events, self.calls), ([], 0))
 
-    def test_stuck_after_three_corrections(self) -> None:
+    def test_three_strikes_without_a_replan_keep_correcting(self) -> None:
         w = self.watcher()
         t = 0.0
         kinds = []
@@ -260,8 +261,8 @@ class WatcherTest(unittest.TestCase):
             ev = run(w, self.feed, [(paint(self.ref, self.masks[0], scale=scale), 1.0, 12.0)], t0=t)
             kinds += [e.kind for _, e in ev]
             t += 20.0
-        self.assertEqual(kinds, ["correction", "correction", "stuck"])
-        self.assertEqual(w.machine.status, "stuck")
+        self.assertEqual(kinds, ["correction", "correction", "correction"])
+        self.assertEqual((w.machine.status, w.machine.state["tries"]), ("active", 3))
 
     def _stuck_run(self, w: Watcher):
         kinds, t = [], 0.0
@@ -289,7 +290,7 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(asked[0][0], 0)
         self.assertEqual(asked[0][2][:2], (H, W))                  # got the last real canvas, not a dummy
 
-    def test_second_stuck_on_the_same_step_is_not_replanned_again(self) -> None:
+    def test_second_struggle_on_the_same_step_is_not_replanned_again(self) -> None:
         w = self.watcher()
         w._replan = lambda *a: [make_step(1, "sky, simpler"), make_step(2, "ground")]
         self._stuck_run(w)                                          # first stuck -> replanned
@@ -298,18 +299,62 @@ class WatcherTest(unittest.TestCase):
             ev = run(w, self.feed, [(paint(self.ref, self.masks[0], scale=scale), 1.0, 12.0)], t0=t)
             kinds += [e.kind for _, e in ev]
             t += 20.0
-        self.assertEqual(kinds, ["correction", "correction", "stuck"])
-        self.assertEqual(w.machine.status, "stuck")
+        self.assertEqual(kinds, ["correction", "correction", "correction"])
+        self.assertEqual(w.machine.status, "active")
 
-    def test_a_failing_replan_falls_back_to_stuck(self) -> None:
+    def test_a_failing_replan_keeps_the_plan_and_says_so(self) -> None:
         def boom(*a):
             raise RuntimeError("api down")
 
         w = self.watcher()
         w._replan = boom
+        logs = []
+        w._log = logs.append
         events = self._stuck_run(w)
-        self.assertEqual([e.kind for e in events], ["correction", "correction", "stuck"])
-        self.assertEqual(w.machine.status, "stuck")
+        self.assertEqual([e.kind for e in events], ["correction", "correction", "correction"])
+        self.assertEqual((w.machine.status, w.machine.current.name), ("active", "sky"))
+        self.assertTrue(any("re-plan of step 1 failed" in m for m in logs))
+
+    def test_steady_coverage_progress_is_not_a_strike(self) -> None:
+        w = self.watcher()
+        cats, t = [], 0.0
+        for frac in (0.1, 0.2, 0.3, 0.4):                    # 20%, 40%, 60%, 80% of the sky, pausing in between
+            ev = run(w, self.feed, [(paint(self.ref, self.masks[0], rows_frac=frac), 1.0, 12.0)], t0=t)
+            cats += [e.verdict.category for _, e in ev]
+            t += 20.0
+        self.assertEqual(cats, ["coverage"] * 4)
+        self.assertEqual(w.machine.state["tries"], 0)                 # every nudge followed real progress
+        self.assertAlmostEqual(w.coverage, 0.8, delta=0.05)           # the live readout
+        ev = run(w, self.feed, [(paint(self.ref, self.masks[0], rows_frac=0.41), 1.0, 12.0)], t0=t)
+        self.assertEqual([e.verdict.category for _, e in ev], ["coverage"])
+        self.assertEqual(w.machine.state["tries"], 1)                 # barely any progress: that one counts
+
+    def test_small_progress_in_a_small_region_still_triggers_a_check(self) -> None:
+        box = np.zeros((H, W), np.uint8)
+        box[:20, :30] = 255                                           # about 6% of the canvas
+        Image.fromarray(box).save(self.dir / "layers" / "1.png")
+        self.ref = np.full_like(self.ref, DEFAULT_BARE_RGB)
+        self.ref[:20, :30] = (200, 215, 235)                          # a pale blue: little brightness change
+        w = self.watcher()
+        half = np.full_like(self.ref, DEFAULT_BARE_RGB)
+        half[:20, :15] = self.ref[:20, :15]
+        full = half.copy()
+        full[:20, :30] = self.ref[:20, :30]
+        a, b = (_small_gray(cv2.cvtColor(c, cv2.COLOR_RGB2BGR)) for c in (half, full))
+        self.assertLess(float(np.abs(a - b).mean()), w.cfg.change_t)  # a whole-frame test misses this progress
+        first = run(w, self.feed, [(half, 1.0, 12.0)])
+        self.assertEqual([e.verdict.category for _, e in first], ["coverage"])
+        done = run(w, self.feed, [(full, 1.0, 6.0)], t0=20.0)
+        self.assertEqual((done[0][1].kind, done[0][1].step_index), ("advanced", 1))
+
+    def test_a_hand_in_the_way_is_logged_once(self) -> None:
+        logs = []
+        w = Watcher(StepMachine(self.steps), self.ref, self.dir, self.feed.capture, lambda *a: READY,
+                    log=logs.append)
+        self.feed.resting_hand = True
+        run(w, self.feed, [(paint(self.ref, self.masks[0]), 1.0, 20.0)])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("looks like a hand", logs[0])
 
     def test_full_two_step_session_completes(self) -> None:
         w = self.watcher()

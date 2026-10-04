@@ -83,15 +83,28 @@ class StepMachineTest(unittest.TestCase):
         self.assertEqual(m.submit(READY), "complete")
         self.assertIsNone(m.current)
 
-    def test_stuck_after_three_tries_then_skip(self) -> None:
+    def test_struggling_after_three_strikes_never_locks_the_step(self) -> None:
         m = StepMachine([make_step(1), make_step(2)])
         self.assertEqual(m.submit(adjust("value")), "retry")
         self.assertEqual(m.submit(adjust("value")), "retry")
-        self.assertEqual(m.submit(adjust("value")), "stuck")
-        with self.assertRaises(RuntimeError):
-            m.submit(READY)
-        self.assertEqual(m.skip(), "advanced")
+        self.assertEqual(m.submit(adjust("value")), "struggling")
+        self.assertEqual(m.status, "active")
+        self.assertEqual(m.submit(READY), "advanced")       # still judged, can still pass
         self.assertEqual((m.current.index, m.state["tries"]), (2, 0))
+
+    def test_a_nudge_that_is_not_a_strike_does_not_count(self) -> None:
+        m = StepMachine([make_step(1), make_step(2)])
+        for _ in range(5):
+            self.assertEqual(m.submit(adjust("coverage"), strike=False), "retry")
+        self.assertEqual(m.state["tries"], 0)
+
+    def test_skip_works_any_time_and_is_recorded(self) -> None:
+        m = StepMachine([make_step(1), make_step(2)])
+        self.assertEqual(m.skip(), "advanced")
+        self.assertEqual(m.state["history"][-1], {"step": 1, "skipped": True})
+        self.assertEqual(m.skip(), "complete")
+        with self.assertRaises(RuntimeError):
+            m.skip()
 
     def test_ready_resets_tries_and_state_round_trips(self) -> None:
         steps = [make_step(1), make_step(2)]

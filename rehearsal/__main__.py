@@ -203,7 +203,7 @@ def sheet(args) -> int:
     planted = next(s for s in lesson if s.index == p["step"])
     lines += ["", "## The planted mistake", "",
               f"On **step {planted.index} ({planted.name})**: {p['how']}", "",
-              f"Expected: once your hand has been out of the region for 2.5 s, the system flags it as "
+              f"Expected: once your hand has been out of the region for 4 s, the system flags it as "
               f"**{EXPECT[p['kind']]}**, blinks the wrong areas on the paper, and the control page says what "
               "to change. Fix it as told; the step should then advance on its own.", "",
               "If it does not fire: note the time and what the page said, press SPACE to carry on.", "",

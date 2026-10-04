@@ -22,16 +22,20 @@ One command: reference image -> Track 3 layers -> projected step by step on the 
 
 With no image the page opens on an upload screen. The upload is saved to scenes/uploads/, but
 for the demo the run uses DEMO_IMAGE (the Bob Ross sunset, whose layers and plan are cached);
---use-upload runs the uploaded image itself (track3.layers ~40 s, then Gemini plans it). Then
+--use-upload runs the uploaded image itself (track3.layers ~40 s, then Gemini plans it). While
+the demo image runs, the upload is first sent to the GIMP server and the run waits for it (the
+remote Track 3 call, saved to scenes/<job_id>/ but not used for the lesson; --no-gimp to skip). Then
 it goes through decompose, plan, rig, canvas and bare-canvas calibration, shown as stages on
 the page, and into the --watch loop below.
 
 --watch (Gate 3, join 3: Track 1 -> Track 2) runs the hands-free loop instead. Track 2's
 watcher sees the canvas through the camera: once the step's region has been still for
-2.5 s after the hand leaves it, it measures coverage and value locally and, when the step
-looks done, asks Gemini to confirm. READY advances to the next step; a correction blinks
-the areas to fix (bare or off-value) and is shown on the control page. Needs plan.json
-(track2.demo plan). SPACE forces the step done, K skips a stuck step, ESC quits.
+2 s after the hand leaves it, it measures coverage and value locally and, when the step
+looks done, asks Gemini to confirm. READY advances to the next step; a correction is shown
+on the control page (the projector keeps showing the step). Needs plan.json
+(track2.demo plan). The page shows how much of the step's area is painted after each check.
+A step that keeps failing is re-planned once, and is never locked: SPACE marks the step done,
+K skips it, ESC quits.
     uv run python -m track1.show my_painting.jpg --watch
 """
 
@@ -43,6 +47,7 @@ import time
 import webbrowser
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from . import Rig
@@ -52,6 +57,8 @@ from .project_scene import scene_steps, step_images, step_overlay
 ROOT = Path(__file__).resolve().parent.parent
 DEMO_IMAGE = ROOT / "fixtures" / "spike_c" / "bobross-sunset.jpg"   # what an upload runs (see --use-upload)
 UPLOADS = ROOT / "scenes" / "uploads"
+ADVANCED = "Beautiful. That one's finished - let's move right along."
+COMPLETE = "And there you have it. Your painting's finished - happy painting, friend."
 
 
 def decompose(image: Path, remote: bool, redo: bool) -> Path:
@@ -85,16 +92,16 @@ def ensure_plan(image: Path, scene: Path, redo: bool) -> tuple[dict[int, dict], 
     """Track 2's lesson for the scene: plan.json if it is there (unless redo), else ask Gemini."""
     if (scene / "plan.json").exists() and not redo:
         plan = load_plan(scene)
-        return plan, f"{len(plan)} steps (saved plan; --replan to ask Gemini again)"
+        return plan, f"{len(plan)} steps, ready and waiting (saved plan; --replan for a fresh one)"
     from track2.demo import scene_masks
     from track2.planner import plan as make_plan
     steps = make_plan(image, scene_masks(image, scene, mock=False), scene_dir=scene)
     (scene / "plan.json").write_text(json.dumps([s.model_dump() for s in steps], indent=2))
-    return load_plan(scene), f"{len(steps)} steps written by Gemini"
+    return load_plan(scene), f"{len(steps)} steps, freshly planned just for you"
 
 
-def receive_upload(panel: Panel, args) -> Path | None:
-    """Upload screen. The upload is saved; the run uses DEMO_IMAGE unless --use-upload."""
+def receive_upload(panel: Panel, args) -> tuple[Path, Path] | None:
+    """Upload screen: (saved upload, image to run). The run uses DEMO_IMAGE unless --use-upload."""
     got = panel.wait_upload()
     if got is None:
         return None
@@ -104,9 +111,36 @@ def receive_upload(panel: Panel, args) -> Path | None:
     saved.write_bytes(data)
     print(f"upload saved to {saved}")
     if args.use_upload:
-        return saved
+        return saved, saved
     print(f"running the demo image {DEMO_IMAGE.name} (--use-upload to run the uploaded image)")
-    return DEMO_IMAGE
+    return saved, DEMO_IMAGE
+
+
+def send_to_gimp(panel: Panel, i: int, upload: Path) -> None:
+    """Send the upload to the GIMP server (track3.remote) and wait for it, before the cached demo goes on."""
+    panel.stage(i, "running", "sending your picture over to the GIMP server")
+    print(f"GIMP server: sending {upload.name}, waiting for it")
+    try:
+        from track3.remote import Remote
+        client = Remote()
+        public = client.process(upload)
+        scene = client.download_scene(public)
+    except BaseException as e:                      # Remote() raises SystemExit when the URL or token is missing
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        print(f"GIMP server call failed (the demo runs on regardless): {type(e).__name__}: {e}")
+        return
+    print(f"GIMP server: job {public['job_id']}, {len(public['steps'])} steps -> {scene} (not used for the lesson)")
+
+
+def show_breakdown(panel: Panel, i: int, scene: Path) -> None:
+    """Put the scene's step contact sheet (track3.layers) under stage i, with the step count."""
+    sheet = scene / "steps-contact-sheet.png"
+    if not sheet.exists():
+        return
+    report = json.loads((scene / "report.json").read_text()) if (scene / "report.json").exists() else {}
+    detail = f"{report['stage_count']} happy little steps, from the back to the front" if "stage_count" in report else scene.name
+    panel.stage(i, "done", detail, image=cv2.imread(str(sheet)))
 
 
 def open_panel(args) -> Panel:
@@ -149,35 +183,46 @@ def main():
     ap.add_argument("--replan", action="store_true", help="ask Gemini for a new plan.json even if one exists")
     ap.add_argument("--use-upload", action="store_true",
                     help=f"upload screen: run the uploaded image instead of {DEMO_IMAGE.name}")
+    ap.add_argument("--no-gimp", action="store_true",
+                    help="upload screen: don't also send the upload to the GIMP server while the demo runs")
     args = ap.parse_args()
     if args.image is not None and not args.image.exists():
         ap.error(f"{args.image} not found")
 
     panel, rig = open_panel(args), None
     try:
-        names = ["Decompose into layers (Track 3)", "Plan the lesson (Track 2)",
-                 "Connect projector and camera (Track 1)", "Find the canvas"]
+        names = ["Finding the layers in your painting", "Planning our lesson together",
+                 "Waking up the projector and camera", "Finding your canvas"]
+        gimp, upload_stage = None, False
         if args.image is None:                       # upload screen, then the whole hands-free flow
-            image = receive_upload(panel, args)
-            if image is None:
+            got = receive_upload(panel, args)
+            if got is None:
                 return
-            args.image, args.watch = image, True
-            names = ["Upload"] + names
+            upload, args.image = got
+            args.watch = True
+            names = ["Pick your painting"] + names
+            upload_stage = True
+            if upload != args.image and not (args.remote or args.no_gimp):
+                gimp = upload                        # the upload goes to GIMP first, then the demo runs
         if args.watch:
-            names.append("Calibrate the bare canvas")
+            names.append("Getting to know your bare canvas")
         panel.stages(names)
         k = 0
-        if names[0] == "Upload":
-            panel.stage(0, "done", f"{args.image.name}" + ("" if args.use_upload else " (demo image)"))
+        if upload_stage:
+            panel.stage(0, "done", f"{args.image.name}"
+                        + ("" if args.use_upload else " (we'll paint the demo picture today)"))
             k = 1
+        if gimp:
+            send_to_gimp(panel, k, gimp)
 
         scene = run_stage(panel, k, lambda: (lambda s: (s, s.name))(decompose(args.image, args.remote, args.redo)),
-                          "splitting the picture into paint layers")
+                          "looking at your picture and splitting it into happy little layers")
+        show_breakdown(panel, k, scene)
         steps = scene_steps(scene)
         images = step_images(scene, steps, mode="layers" if args.layers else "steps")
         try:
             plan = run_stage(panel, k + 1, lambda: ensure_plan(args.image, scene, args.replan),
-                             "Gemini is writing the mixes and techniques")
+                             "mixing up the colours and working out every stroke")
         except Exception as e:
             if args.watch:
                 raise
@@ -188,17 +233,17 @@ def main():
         def connect():
             r = Rig(args.projector)
             r.frame()
-            return r, f"{r.settings['projector']} projector, camera {r.cam_size[0]}x{r.cam_size[1]}"
-        rig = run_stage(panel, k + 2, connect, "opening the camera")
+            return r, f"all set: {r.settings['projector']} projector, camera {r.cam_size[0]}x{r.cam_size[1]}"
+        rig = run_stage(panel, k + 2, connect, "letting the camera have a look around")
         if args.any_shape:
             rig.settings["canvas_mm"] = None
 
         def canvas():
             if args.detect or rig.quad_cam is None:
                 rig.detect_canvas()
-                return None, "found the paper"
-            return None, "using the saved paper corners (--detect to find them again)"
-        run_stage(panel, k + 3, canvas, "looking for the paper")
+                return None, "there it is - found your canvas"
+            return None, "using the canvas corners we saved last time (--detect to find them again)"
+        run_stage(panel, k + 3, canvas, "looking for your canvas")
 
         if args.watch:
             watch(rig, panel, args, scene, steps, images, plan, calibrate_stage=k + 4)
@@ -262,43 +307,42 @@ def watch(rig, panel, args, scene, steps, images, plan, calibrate_stage=None):
     critique = (lambda canvas, step, mask: Verdict(verdict="READY", category="none", adjustment="")) \
         if args.offline else None
     w = Watcher(machine, ref, scene, capture, critique,
-                replan_fn=None if args.offline else default_replan(ref, machine, scene))
+                replan_fn=None if args.offline else default_replan(ref, machine, scene),
+                log=lambda msg: print(f"watcher: {msg}", flush=True))
     print("calibrating bare canvas from a capture of the paper ...")
     if calibrate_stage is not None:
-        run_stage(panel, calibrate_stage, lambda: (w.calibrate(capture()), "flash-lit capture of the blank paper"),
-                  "keep the paper blank and hands clear")
+        run_stage(panel, calibrate_stage, lambda: (w.calibrate(capture()), "got a good look at your blank canvas"),
+                  "keep the canvas blank and your hands clear, just for a moment")
     else:
         w.calibrate(capture())
 
-    outline, shown, status = args.outline, None, "watching: paint the region; I check 2.5 s after your hand leaves it"
+    outline, shown, tone = args.outline, None, None
+    status = "Go ahead and paint this area. Whenever your brush leaves it, I'll take a little peek after about 2 seconds."
     t0 = time.monotonic()
     while machine.status != "complete":
         i = machine.state["current"]
-        if shown != (i, outline, status):
+        painted = None if w.coverage is None else round(w.coverage * 100)
+        if shown != (i, outline, status, painted):
             if shown is None or shown[:2] != (i, outline):
                 rig.project_overlay(*step_overlay(steps[i], images[i], fill_only=not outline))
             panel.update(step=steps[i], index=i + 1, count=len(steps), outline=outline, watching=True,
                          lesson=machine.steps[i].model_dump() if i < len(machine.steps) else None,
-                         lessons=[s.model_dump() for s in machine.steps], status=status,
-                         preview=images[i] if shown is None or shown[0] != i else None)
-            shown = (i, outline, status)
+                         lessons=[s.model_dump() for s in machine.steps], status=status, tone=tone,
+                         painted=painted, preview=images[i] if shown is None or shown[0] != i else None)
+            shown = (i, outline, status, painted)
 
         now = time.monotonic() - t0
-        ev = w.tick(peek(), now) if machine.status == "active" else None
+        ev = w.tick(peek(), now)
         if ev is not None:
             text = ev.verdict.adjustment if ev.verdict and ev.verdict.adjustment else ""
             print(f"[{now:6.1f}s] step {ev.step_index}: {ev.kind} ({ev.source}) {text}", flush=True)
             if ev.kind in ("advanced", "complete"):
-                status = "step complete - next step" if ev.kind == "advanced" else "painting complete"
+                status, tone = ADVANCED if ev.kind == "advanced" else COMPLETE, "done"
             elif ev.kind == "replanned":
-                status = "re-planned: " + (ev.new_steps[0].technique if ev.new_steps else "")
-            elif ev.kind == "stuck":
-                status = f"stuck: {text}  (K to skip)"
-            else:
-                status = f"fix: {text}"
-                where = ev.missing if ev.missing is not None else ev.off_value
-                if where is not None and where.any():
-                    rig.flash_correction(np.where(where, 255, 0).astype(np.uint8), times=3)
+                status = "Let's try this a different way. " + (ev.new_steps[0].technique if ev.new_steps else "")
+                tone = None
+            else:           # the step stays projected; the correction is only shown on the page
+                status, tone = text, None
 
         key = panel.key(0.2)
         if key == "quit":
@@ -306,21 +350,21 @@ def watch(rig, panel, args, scene, steps, images, plan, calibrate_stage=None):
         if args.seconds and now > args.seconds:
             print("time limit reached")
             break
-        if key == "next" and machine.status == "active":          # painter says it's done
+        if key == "next":                                           # painter says it's done
             machine.submit(Verdict(verdict="READY", category="none", adjustment=""))
             w.rebase(capture())       # the next step is judged from the canvas as it is now
             w._reset_step()
-            status = "marked done - next step"
-        elif key == "skip" and machine.status == "stuck":
+            status, tone = "You're the boss on this canvas. On to the next one.", "done"
+        elif key == "skip":
             machine.skip()
             w.rebase(capture())
             w._reset_step()
-            status = "skipped - next step"
+            status, tone = "That's fine, we'll let that one be. On to the next one.", "done"
         elif key == "outline":
             outline = not outline
     if machine.status == "complete":
         panel.update(step=steps[-1], index=len(steps), count=len(steps), outline=outline, watching=True,
-                     lessons=[s.model_dump() for s in machine.steps], status="painting complete",
+                     lessons=[s.model_dump() for s in machine.steps], status=COMPLETE, tone="done",
                      lesson=machine.steps[-1].model_dump())
         time.sleep(1.0)     # let the page pick up the final state
     print(f"session: {machine.status}, step {machine.state['current'] + 1} of {len(steps)}")
