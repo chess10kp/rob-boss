@@ -1,0 +1,14 @@
+[project]
+name = "rob-boss"
+version = "0.1.0"
+description = "PalettePilot - projected light-guide painting on the HP Sprout Pro"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "opencv-python>=4.8",   # projection, camera capture, checkerboard + rectangle detection
+    "numpy>=1.24",
+    "screeninfo>=0.8",      # finds the projector's position on the Windows desktop
+    "pygrabber>=0.2",       # DirectShow camera names for --list
+]
+
+[tool.uv]
+package = false             # plain scripts, nothing to build/install
