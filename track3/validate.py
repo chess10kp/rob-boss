@@ -9,6 +9,8 @@ from typing import Sequence
 import numpy as np
 from PIL import Image
 
+from track3.components import component_sizes
+
 EXPECTED_MASKS = (
     "01_darkest.png",
     "02_dark.png",
@@ -17,12 +19,20 @@ EXPECTED_MASKS = (
     "05_lightest.png",
 )
 MIN_COVERAGE = 0.04
+MIN_COMPONENT_FRACTION = 0.001
+MAX_PAINTABLE_COMPONENTS = 12
+TOP_COMPONENT_COUNT = 10
+MIN_TOP_COMPONENT_COVERAGE = 0.90
 
 
 @dataclass(frozen=True)
 class MaskSummary:
     path: str
     coverage: float
+    component_count: int
+    small_component_count: int
+    paintable_component_count: int
+    largest_10_area_fraction: float
 
 
 @dataclass(frozen=True)
@@ -33,20 +43,29 @@ class ValidationReport:
     gap_pixels: int
     overlap_pixels: int
     errors: tuple[str, ...]
+    paintability_errors: tuple[str, ...]
 
     @property
     def passed(self) -> bool:
         return not self.errors
 
+    @property
+    def paintable(self) -> bool:
+        return not self.paintability_errors
+
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
         result["passed"] = self.passed
+        result["paintable"] = self.paintable
         return result
+
+
 
 
 def validate_scene(scene_dir: Path) -> ValidationReport:
     layers_dir = scene_dir / "layers"
     errors: list[str] = []
+    paintability_errors: list[str] = []
     summaries: list[MaskSummary] = []
     foregrounds: list[np.ndarray] = []
     dimensions: tuple[int, int] | None = None
@@ -59,6 +78,7 @@ def validate_scene(scene_dir: Path) -> ValidationReport:
             gap_pixels=0,
             overlap_pixels=0,
             errors=(f"missing layers directory: {layers_dir}",),
+            paintability_errors=(),
         )
 
     png_names = {path.name for path in layers_dir.glob("*.png")}
@@ -100,12 +120,56 @@ def validate_scene(scene_dir: Path) -> ValidationReport:
             errors.append(f"{name}: non-binary pixel values: {preview}")
 
         foreground = pixels == 255
-        coverage = float(np.count_nonzero(foreground) / foreground.size)
-        summaries.append(MaskSummary(path=f"layers/{name}", coverage=coverage))
+        foreground_pixels = int(np.count_nonzero(foreground))
+        coverage = float(foreground_pixels / foreground.size)
+        component_sizes_for_mask = sorted(component_sizes(foreground), reverse=True)
+        minimum_component_area = max(
+            1, int(np.ceil(foreground.size * MIN_COMPONENT_FRACTION))
+        )
+        small_component_count = sum(
+            size < minimum_component_area for size in component_sizes_for_mask
+        )
+        paintable_component_count = (
+            len(component_sizes_for_mask) - small_component_count
+        )
+        largest_10_area_fraction = (
+            float(
+                sum(component_sizes_for_mask[:TOP_COMPONENT_COUNT])
+                / foreground_pixels
+            )
+            if foreground_pixels
+            else 0.0
+        )
+        summaries.append(
+            MaskSummary(
+                path=f"layers/{name}",
+                coverage=coverage,
+                component_count=len(component_sizes_for_mask),
+                small_component_count=small_component_count,
+                paintable_component_count=paintable_component_count,
+                largest_10_area_fraction=largest_10_area_fraction,
+            )
+        )
         foregrounds.append(foreground)
         if coverage < MIN_COVERAGE:
             errors.append(
                 f"{name}: coverage {coverage:.6f} is below {MIN_COVERAGE:.2%}"
+            )
+        if small_component_count:
+            paintability_errors.append(
+                f"{name}: {small_component_count} components are smaller than "
+                f"{MIN_COMPONENT_FRACTION:.2%} of the canvas"
+            )
+        if paintable_component_count > MAX_PAINTABLE_COMPONENTS:
+            paintability_errors.append(
+                f"{name}: {paintable_component_count} paintable components exceed "
+                f"the limit of {MAX_PAINTABLE_COMPONENTS}"
+            )
+        if largest_10_area_fraction < MIN_TOP_COMPONENT_COVERAGE:
+            paintability_errors.append(
+                f"{name}: largest {TOP_COMPONENT_COUNT} components cover "
+                f"{largest_10_area_fraction:.2%}, below "
+                f"{MIN_TOP_COMPONENT_COVERAGE:.0%}"
             )
 
     gap_pixels = 0
@@ -127,6 +191,7 @@ def validate_scene(scene_dir: Path) -> ValidationReport:
         gap_pixels=gap_pixels,
         overlap_pixels=overlap_pixels,
         errors=tuple(errors),
+        paintability_errors=tuple(paintability_errors),
     )
 
 

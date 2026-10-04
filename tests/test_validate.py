@@ -35,6 +35,8 @@ class ValidateSceneTest(unittest.TestCase):
         self.assertEqual(report.overlap_pixels, 0)
         self.assertEqual([mask.coverage for mask in report.masks], [0.2] * 5)
 
+        self.assertTrue(report.paintable, report.paintability_errors)
+
     def test_rejects_gap(self) -> None:
         labels = np.tile(np.arange(5, dtype=np.uint8), (10, 2)).reshape(10, 10)
         self.write_labels(labels)
@@ -73,6 +75,20 @@ class ValidateSceneTest(unittest.TestCase):
         self.assertEqual(report.gap_pixels, 0)
         self.assertEqual(report.overlap_pixels, 0)
         self.assertIn("coverage 0.030000 is below 4.00%", "\n".join(report.errors))
+
+    def test_reports_confetti_separately_from_contract_failure(self) -> None:
+        labels = np.repeat(np.arange(5, dtype=np.uint8), 20)
+        labels = np.tile(labels, (100, 1))
+        for index in range(20):
+            labels[2 + index * 4, 25] = 0
+        self.write_labels(labels)
+
+        report = validate_scene(self.scene_dir)
+
+        self.assertTrue(report.passed, report.errors)
+        self.assertFalse(report.paintable)
+        self.assertEqual(report.masks[0].small_component_count, 20)
+        self.assertEqual(report.masks[0].paintable_component_count, 1)
 
 
 if __name__ == "__main__":
