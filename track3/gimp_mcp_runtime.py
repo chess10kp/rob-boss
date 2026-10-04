@@ -141,19 +141,20 @@ def gimp_service(install_dir: Path, timeout_seconds: float = 30.0) -> Iterator[N
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        deadline = time.monotonic() + timeout_seconds
-        while not _port_open():
-            if process.poll() is not None:
-                raise RuntimeError(
-                    f"GIMP exited with status {process.returncode}; see {paths['log']}"
-                )
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"GIMP MCP did not open localhost:{GIMP_PORT}; see {paths['log']}"
-                )
-            time.sleep(0.1)
-
+        # The startup wait is inside the try: a GIMP that is too slow to open the port must
+        # still be killed, or it binds 9877 later and every following request is refused.
         try:
+            deadline = time.monotonic() + timeout_seconds
+            while not _port_open():
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        f"GIMP exited with status {process.returncode}; see {paths['log']}"
+                    )
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"GIMP MCP did not open localhost:{GIMP_PORT}; see {paths['log']}"
+                    )
+                time.sleep(0.1)
             yield
         finally:
             try:
