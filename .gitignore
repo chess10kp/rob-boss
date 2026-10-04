@@ -7,5 +7,6 @@ config/cam_to_proj_homography.npz
 config/tape_marks.json
 config/swatch_marks.json
 config/canvas_quad.json
+config/projector_profile.json
 config/logs/
 scenes/

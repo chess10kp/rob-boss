@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 
 from config import rig as config_rig
-from . import geometry, overlay
+from . import colour, geometry, overlay
 
 QUAD_PATH = config_rig.CONFIG_DIR / "canvas_quad.json"
 DEFAULTS = {
@@ -36,6 +36,7 @@ DEFAULTS = {
     "flash_level": 190,               # grey used to light captures (Spike B)
     "flash_settle_s": 0.4,            # change -> camera: ~0.15 s direct, ~0.3 s via LightGuide
     "canvas_mm": None,                # [w, h] of the canvas, e.g. letter paper; checks detected shape
+    "colour_correct": True,           # pre-correct overlays with config/projector_profile.json, if present
 }
 
 
@@ -65,6 +66,9 @@ class Rig:
             res = config_rig.parse_res(s["cam_res"]) if s.get("cam_res") else None
             self.camera = DirectCamera(s.get("camera", 0), res)
         self.proj_size = self.projector.proj_size
+        self.profile = None
+        if s["colour_correct"] and colour.PROFILE_PATH.exists():
+            self.profile = colour.Profile.load()
         self._black = np.zeros((self.proj_size[1], self.proj_size[0], 3), np.uint8)
         self._overlay = self._black
         self._cam_to_proj = None
@@ -189,6 +193,8 @@ class Rig:
     def _overlay_image(self, mask, style):
         self._require_quad()
         img = overlay.render(mask, style, self.canvas_size())
+        if self.profile is not None:                 # the projector is short of red (track1/colour.py)
+            img = self.profile.correct(img)
         return geometry.canvas_to_projector(img, self.quad_proj, self.proj_size)
 
     def _show(self, img):

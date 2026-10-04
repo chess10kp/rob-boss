@@ -20,6 +20,8 @@ DEFAULT_STYLE = {
                                # fill_rgb (e.g. a track3.layers RGBA layer; its alpha is ignored)
     "fill_alpha": 0.35,        # fill brightness 0-1 (it's light, not paint: 1 = full colour)
     "outline": True,           # boundary lines
+    "outline_mask": None,      # path/array: outline this region instead of the filled one (e.g. the
+                               # part of a layer that stays visible, while the fill covers all of it)
     "outline_rgb": (255, 255, 255),
     "outline_px": 3,
     "arrows": False,           # stroke-direction arrows
@@ -95,6 +97,12 @@ def render(mask, style=None, size=None):
         draw_arrows(img, region, float(st["stroke_dir_deg"]), float(st["arrow_spacing_px"]),
                     bgr(st["arrow_rgb"]), int(st["arrow_px"]))
     if st["outline"]:
-        contours, _ = cv2.findContours(region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        edge = region
+        if st["outline_mask"] is not None:
+            om = load_mask(st["outline_mask"])
+            if om.shape != region.shape:
+                om = cv2.resize(om, (region.shape[1], region.shape[0]), interpolation=cv2.INTER_LINEAR)
+            edge = om > 127
+        contours, _ = cv2.findContours(edge.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         cv2.drawContours(img, contours, -1, bgr(st["outline_rgb"]), int(st["outline_px"]), cv2.LINE_AA)
     return img

@@ -92,6 +92,56 @@ class GeometryTest(unittest.TestCase):
         self.assertIsNone(geometry.detect_canvas_quad(frame, H, PROJ))
 
 
+class ColourProfileTest(unittest.TestCase):
+    def test_fit_recovers_projector_and_correction_lands_on_target(self):
+        from track1.colour import Profile, to_linear, to_srgb
+        rng = np.random.default_rng(1)
+        sent = rng.uniform(20, 245, (40, 3))
+        # short of red; cross terms kept positive so no sent colour asks for negative light
+        M = np.array([[0.7, 0.05, 0.02], [0.02, 1.0, 0.05], [0.01, 0.05, 0.95]])
+        b = np.array([0.03, 0.0, 0.0])
+        paper = lambda s: to_srgb(to_linear(s) @ M.T + b)                         # simulated projector
+        p = Profile.fit(sent, paper(sent))
+        np.testing.assert_allclose(p.M, M, atol=1e-3)
+        want = np.array([[200.0, 120.0, 60.0], [90.0, 140.0, 200.0]])
+        got = paper(p.drive(want))
+        np.testing.assert_allclose(to_linear(got), p.k * to_linear(want), atol=2e-3)
+        self.assertLess(p.k, 1.0)                                                 # white needs dimming
+
+    def test_correct_keeps_black_black(self):
+        from track1.colour import Profile
+        p = Profile(np.eye(3), np.array([0.02, 0, 0]), 0.8)
+        img = np.zeros((4, 4, 3), np.uint8)
+        img[0, 0] = (50, 100, 200)
+        out = p.correct(img)
+        self.assertEqual(out[3, 3].sum(), 0)
+        self.assertGreater(out[0, 0].sum(), 0)
+
+
+class MaskedStepTest(unittest.TestCase):
+    def test_step_is_compiled_frame_masked_by_its_own_layer(self):
+        """canvas = canvas * (1 - alpha) + colour * alpha builds the main image; each step
+        then lights only its own layer's area of it, with opacity divided out of the mask."""
+        import tempfile
+        from pathlib import Path
+        from track1.project_scene import compiled_frames, masked_step
+        with tempfile.TemporaryDirectory() as d:
+            under = np.zeros((10, 10, 4), np.uint8)
+            under[...] = (255, 0, 0, 255)                                 # layer 1: opaque blue (BGRA)
+            over = np.zeros((10, 10, 4), np.uint8)
+            over[...] = (0, 0, 255, 0)                                    # layer 2: red at opacity 0.5 ...
+            over[:, :5, 3] = 128                                          # ... on the left half only
+            paths = [Path(d) / "1.png", Path(d) / "2.png"]
+            cv2.imwrite(str(paths[0]), under)
+            cv2.imwrite(str(paths[1]), over)
+            frames = compiled_frames(paths, bare=245)
+            step2 = masked_step(frames[1], paths[1], opacity=0.5)
+        a = 128 / 255
+        # inside layer 2: the compiled colour (red over blue at 50%), at full brightness
+        np.testing.assert_allclose(step2[0, 0], np.round([255 * (1 - a), 0, 255 * a]), atol=1)
+        self.assertEqual(step2[0, 9].sum(), 0)                            # outside layer 2: dark
+
+
 class OverlayTest(unittest.TestCase):
     def setUp(self):
         self.mask = np.zeros((400, 600), np.uint8)
@@ -119,6 +169,16 @@ class OverlayTest(unittest.TestCase):
         self.assertEqual(tuple(img[200, 150]), (255, 0, 0))
         self.assertEqual(tuple(img[200, 350]), (0, 0, 255))
         self.assertEqual(img[50, 50].sum(), 0)                          # outside the mask stays dark
+
+    def test_outline_mask_outlines_visible_part_while_fill_covers_whole_layer(self):
+        visible = np.zeros_like(self.mask)
+        visible[100:300, 250:400] = 255                                 # right part of the filled region
+        img = overlay.render(self.mask, {"fill_rgb": (0, 0, 255), "fill_alpha": 1.0,
+                                         "outline_rgb": (0, 255, 0), "outline_px": 3,
+                                         "outline_mask": visible})
+        self.assertEqual(tuple(img[200, 150]), (255, 0, 0))            # buried part is still filled
+        self.assertEqual(tuple(img[200, 250]), (0, 255, 0))            # outline runs along the visible part
+        self.assertNotEqual(tuple(img[200, 100]), (0, 255, 0))         # not along the filled region's edge
 
     def test_render_resizes_mask(self):
         img = overlay.render(self.mask, size=(300, 200))
