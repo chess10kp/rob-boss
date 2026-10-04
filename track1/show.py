@@ -308,10 +308,12 @@ def watch(rig, panel, args, scene, steps, images, plan, calibrate_stage=None):
             break
         if key == "next" and machine.status == "active":          # painter says it's done
             machine.submit(Verdict(verdict="READY", category="none", adjustment=""))
+            w.rebase(capture())       # the next step is judged from the canvas as it is now
             w._reset_step()
             status = "marked done - next step"
         elif key == "skip" and machine.status == "stuck":
             machine.skip()
+            w.rebase(capture())
             w._reset_step()
             status = "skipped - next step"
         elif key == "outline":

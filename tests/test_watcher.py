@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -316,6 +317,61 @@ class WatcherTest(unittest.TestCase):
         step2 = paint(self.ref, self.masks[1], base=step1)
         events = run(w, self.feed, [(step1, 2.0, 8.0), (step2, 2.0, 8.0)])
         self.assertEqual([e.kind for _, e in events], ["advanced", "complete"])
+
+
+class LayerStackTest(unittest.TestCase):
+    """A track3.layers scene: a wash over everything, then a band painted over the wash."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        for sub in ("masks", "steps"):
+            (self.dir / sub).mkdir()
+        wash = np.full((H, W, 3), (150, 140, 160), np.uint8)            # step 1: mauve wash, whole sheet
+        band = wash.copy()
+        band[:H // 2] = (60, 110, 200)                                   # step 2: blue band, top half
+        self.frames = [wash, band]
+        visible = [np.zeros((H, W), np.uint8), np.zeros((H, W), np.uint8)]
+        visible[0][H // 2:], visible[1][:H // 2] = 255, 255
+        report = {"steps": []}
+        for i, (name, frame, vis) in enumerate(zip(("wash", "band"), self.frames, visible), 1):
+            Image.fromarray(vis).save(self.dir / "masks" / f"0{i}_{name}.png")
+            Image.fromarray(frame).save(self.dir / "steps" / f"0{i}_{name}.png")
+            report["steps"].append({"mask_path": f"masks/0{i}_{name}.png", "step_path": f"steps/0{i}_{name}.png"})
+        (self.dir / "report.json").write_text(json.dumps(report))
+        self.steps = [make_step(1, "wash").model_copy(update={"mask_path": "masks/01_wash.png"}),
+                      make_step(2, "band").model_copy(update={"mask_path": "masks/02_band.png"})]
+        self.feed = SimFeed((W, H))
+        self.feed.set(np.full((H, W, 3), 245, np.uint8))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def watcher(self) -> Watcher:
+        w = Watcher(StepMachine(self.steps), self.frames[1], self.dir, self.feed.capture, lambda *a: READY)
+        w.calibrate(self.feed.capture())
+        return w
+
+    def test_later_step_is_judged_from_the_canvas_it_started_on(self) -> None:
+        w = self.watcher()
+        events = run(w, self.feed, [(self.frames[0], 2.0, 8.0)])          # wash done
+        self.assertEqual([e.kind for _, e in events], ["advanced"])
+        events = run(w, self.feed, [(self.frames[0], 2.0, 3.0)], t0=20.0)  # hand loads the brush, pauses
+        self.assertEqual(events, [])        # band not painted yet: the wash under it is not the band
+        half = self.frames[0].copy()
+        half[:H // 4] = self.frames[1][:H // 4]
+        events = run(w, self.feed, [(half, 2.0, 4.0)], t0=40.0)
+        self.assertEqual(events, [])        # half the band: progress, not done
+        events = run(w, self.feed, [(self.frames[1], 2.0, 8.0)], t0=50.0)
+        self.assertEqual([e.kind for _, e in events], ["complete"])
+
+    def test_too_dark_band_over_the_wash_is_a_value_correction(self) -> None:
+        w = self.watcher()
+        run(w, self.feed, [(self.frames[0], 2.0, 8.0)])
+        dark = self.frames[0].copy()
+        dark[:H // 2] = (25, 45, 90)
+        events = run(w, self.feed, [(dark, 2.0, 10.0)], t0=20.0)
+        self.assertEqual([(e.kind, e.verdict.category) for _, e in events], [("correction", "value")])
 
 
 if __name__ == "__main__":

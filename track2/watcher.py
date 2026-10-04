@@ -30,6 +30,7 @@ projector flash); `capture()` is the accurate flash-lit capture, called only whe
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -42,6 +43,9 @@ from track2 import cv as cvmod
 from track2 import mixfix
 from track2.machine import StepMachine
 from track2.schema import Step, Verdict
+
+
+STACK_BARE = 245     # track3.layers' BARE_CANVAS: the picture before a stack's first step
 
 
 @dataclass
@@ -116,7 +120,8 @@ class Watcher:
         self._critique = critique_fn or default_critique(ref_rgb)
         self._replan = replan_fn
         self._replanned: set[int] = set()   # step indexes already re-planned once: never loop
-        self._masks: dict[int, np.ndarray] = {}
+        self._masks: dict[int, tuple] = {}
+        self._frames: dict[str, tuple[Path | None, Path]] | None = None
         self._grown: dict[int, np.ndarray] = {}
         self._reset_step()
         self._prev: np.ndarray | None = None
@@ -135,10 +140,43 @@ class Watcher:
         self._last_canvas: np.ndarray | None = None    # last capture accepted as unobstructed
         self._occluded_since: float | None = None
 
-    def _mask(self, step: Step) -> np.ndarray:
+    def rebase(self, canvas_bgr: np.ndarray) -> None:
+        """A step is finished: the canvas as it is now is the starting point for the next one."""
+        self.bare_image = cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2RGB)
+
+    def _stack_frames(self) -> dict[str, tuple[Path | None, Path]]:
+        """Track 3 layer stack: mask stem -> (expected picture before the step, after it)."""
+        if self._frames is None:
+            self._frames, before = {}, None
+            report = self.scene_dir / "report.json"
+            for s in json.loads(report.read_text())["steps"] if report.exists() else []:
+                if s.get("step_path"):
+                    after = self.scene_dir / s["step_path"]
+                    self._frames[Path(s["mask_path"]).stem] = (before, after)
+                    before = after
+        return self._frames
+
+    def _target(self, step: Step) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+        """(reference, expected-before, mask) to measure the step against.
+
+        Layer stack: the step's frame is the reference and the mask is where it differs from
+        the previous frame (what this step changes, under later layers too, so it can be
+        checked as it is painted). Otherwise: the final reference and the step's own mask."""
         if step.index not in self._masks:
-            self._masks[step.index] = np.asarray(Image.open(self.scene_dir / step.mask_path).convert("L"))
+            frames = self._stack_frames().get(Path(step.mask_path).stem)
+            if frames:
+                after = np.asarray(Image.open(frames[1]).convert("RGB"))
+                before = np.asarray(Image.open(frames[0]).convert("RGB")) if frames[0] else \
+                    np.full_like(after, STACK_BARE)
+                change = np.linalg.norm(cvmod.to_lab(after) - cvmod.to_lab(before), axis=2) > self.cfg.paint_de
+                self._masks[step.index] = (after, before, np.where(change, 255, 0).astype(np.uint8))
+            else:
+                mask = np.asarray(Image.open(self.scene_dir / step.mask_path).convert("L"))
+                self._masks[step.index] = (self.ref, None, mask)
         return self._masks[step.index]
+
+    def _mask(self, step: Step) -> np.ndarray:
+        return self._target(step)[2]
 
     def _grown_region(self, step: Step) -> np.ndarray:
         """The step's region grown by region_margin (bool, mask size): where hands and motion count."""
@@ -176,13 +214,13 @@ class Watcher:
             return None                                             # nothing new to look at
         self._checked, self._recheck_at = small, None
 
-        mask = self._mask(step)
+        target, before, mask = self._target(step)
         canvas = cv2.cvtColor(self.capture(), cv2.COLOR_BGR2RGB)
         if self._obstructed(canvas, mask, step, now):               # hand/brush in the way: look again soon
             self._recheck_at = now + cfg.recheck_gap_s
             return None
-        m = cvmod.measure(canvas, self.ref, mask, bare_rgb=self.bare_rgb, bare_image=self.bare_image,
-                          paint_de=cfg.paint_de, value_dl=cfg.value_dl)
+        m = cvmod.measure(canvas, target, mask, bare_rgb=self.bare_rgb, bare_image=self.bare_image,
+                          before_rgb=before, paint_de=cfg.paint_de, value_dl=cfg.value_dl)
 
         verdict, source = None, "cv"
         if m.checkable and m.delta_l is not None and m.coverage >= cfg.min_cov_for_value \
@@ -202,6 +240,7 @@ class Watcher:
             # CV already verified coverage and value; Gemini may only object about strokes.
             if verdict.verdict == "READY" or verdict.category != "stroke_direction":
                 verdict = Verdict(verdict="READY", category="none", adjustment="")
+                self.rebase(cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
                 return self._advance(step, verdict, now)
 
         if source == "cv":                                          # debounce CV corrections over time
@@ -219,8 +258,10 @@ class Watcher:
 
     def _obstructed(self, canvas: np.ndarray, mask: np.ndarray, step: Step, now: float) -> bool:
         cfg = self.cfg
-        occ = cvmod.occlusion(canvas, self.ref, mask, self._last_canvas if cfg.outside_change_blocks else None,
-                              within=self._grown_region(step))
+        target, _, _ = self._target(step)
+        expected = [img for img in (self.ref, self.bare_image) if img is not None and img is not target]
+        occ = cvmod.occlusion(canvas, target, mask, self._last_canvas if cfg.outside_change_blocks else None,
+                              within=self._grown_region(step), also_expected=expected)
         if occ.skin_frac > cfg.skin_frac_t:
             self._occluded_since = self._occluded_since if self._occluded_since is not None else now
             return True
